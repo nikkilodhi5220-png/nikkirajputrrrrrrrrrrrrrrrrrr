@@ -223,9 +223,9 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Safe Human Pacing (2.5s to 5.0s randomized delay for Gmail Inboxing)
+    // Safe Human Pacing (0.5s to 1.0s randomized delay for Gmail Inboxing)
     if (index < recipients.length - 1) {
-      const safeDelay = Math.floor(2500 + Math.random() * 2500);
+      const safeDelay = Math.floor(300 + Math.random() * 300);
       await new Promise(resolve => setTimeout(resolve, safeDelay));
     }
   }

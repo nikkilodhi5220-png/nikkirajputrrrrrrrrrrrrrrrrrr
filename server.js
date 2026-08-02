@@ -53,7 +53,7 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   TRANSPORTER POOLING (Optimized for Gmail Inbox Delivery)
+   TRANSPORTER POOLING (Gmail Delivery Optimized)
    ========================================================================== */
 function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -64,9 +64,10 @@ function getTransporter(email, appPassword) {
       service: "gmail",
       auth: { user: cleanEmail, pass: appPassword },
       pool: true,
-      maxConnections: 1, // Reduced to 1 to prevent Gmail rate-limit spam flags
-      maxMessages: 100,
-      rateLimit: 1 // Throttle automatically
+      maxConnections: 1, // Reduced to avoid Gmail SMTP rate-limit bans
+      maxMessages: 50,
+      rateDelta: 5000,   // Rate limit window
+      rateLimit: 1       // 1 email per delta window
     });
     transporters.set(cacheKey, transporter);
   }
@@ -74,7 +75,7 @@ function getTransporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   SPINTAX PARSER ({Hi|Hello|Hey}) - Crucial for Inbox Differentiation
+   SPINTAX PARSER ({Hi|Hello|Hey}) - Essential for Body Uniqueness
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
@@ -92,7 +93,7 @@ function parseSpintax(text) {
 }
 
 /* ==========================================================================
-   PLAIN-TEXT CONVERTER (Proper Dual MIME Structure)
+   PLAIN-TEXT CONVERTER (Dual MIME Structure)
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -145,7 +146,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (Safe Pacing & Inbox Optimized Headers)
+   SSE STREAM ROUTE (Safe Pacing & Natural Headers)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -192,22 +193,14 @@ app.post("/api/send-stream", async (req, res) => {
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      // Unique Gmail-friendly Message-ID
-      const domain = 'mail.gmail.com';
-      const msgId = `<${Date.now()}.${Math.random().toString(36).substring(2, 10)}@${domain}>`;
-
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
         replyTo: senderEmail,
-        subject: spunSubject,
-        headers: {
-          'Message-ID': msgId,
-          'X-Mailer': 'Gmail Web Interface', // Real user emulation
-          'List-Unsubscribe': `<mailto:${senderEmail}?subject=Unsubscribe>`
-        }
+        subject: spunSubject
       };
 
+      // Set clean dual HTML + Text content
       if (isHtml) {
         mailOptions.html = spunBody;
         mailOptions.text = convertHtmlToText(spunBody);
@@ -223,9 +216,9 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Safe Human Pacing (0.5s to 1.0s randomized delay for Gmail Inboxing)
+    // Organic Human Pacing (3.5s to 7.0s random delay between emails)
     if (index < recipients.length - 1) {
-      const safeDelay = Math.floor(300 + Math.random() * 300);
+      const safeDelay = Math.floor(3500 + Math.random() * 3500);
       await new Promise(resolve => setTimeout(resolve, safeDelay));
     }
   }

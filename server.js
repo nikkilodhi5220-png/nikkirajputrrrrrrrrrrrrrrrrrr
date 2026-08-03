@@ -4,6 +4,7 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -53,7 +54,7 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   TRANSPORTER POOLING (Gmail Delivery Optimized)
+   TRANSPORTER POOLING (Gmail Safe Limits)
    ========================================================================== */
 function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -64,10 +65,10 @@ function getTransporter(email, appPassword) {
       service: "gmail",
       auth: { user: cleanEmail, pass: appPassword },
       pool: true,
-      maxConnections: 1, // Reduced to avoid Gmail SMTP rate-limit bans
+      maxConnections: 1, // Rate limit strictly to 1 connection to prevent Gmail bans
       maxMessages: 50,
-      rateDelta: 5000,   // Rate limit window
-      rateLimit: 1       // 1 email per delta window
+      rateDelta: 5000,
+      rateLimit: 1
     });
     transporters.set(cacheKey, transporter);
   }
@@ -75,7 +76,7 @@ function getTransporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   SPINTAX PARSER ({Hi|Hello|Hey}) - Essential for Body Uniqueness
+   SPINTAX PARSER ({Hi|Hello|Hey}) - Unique Email Generation
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
@@ -93,7 +94,7 @@ function parseSpintax(text) {
 }
 
 /* ==========================================================================
-   PLAIN-TEXT CONVERTER (Dual MIME Structure)
+   PLAIN-TEXT CONVERTER (Ensures Dual MIME Structure)
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -146,7 +147,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (Safe Pacing & Natural Headers)
+   SSE STREAM ROUTE (Inbox Delivery Engine)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -193,14 +194,18 @@ app.post("/api/send-stream", async (req, res) => {
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
+      // Generate RFC-compliant Unique Message-ID
+      const randomId = crypto.randomBytes(8).toString('hex');
+      const customMessageId = `<${Date.now()}.${randomId}@mail.gmail.com>`;
+
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
         replyTo: senderEmail,
-        subject: spunSubject
+        subject: spunSubject,
+        messageId: customMessageId
       };
 
-      // Set clean dual HTML + Text content
       if (isHtml) {
         mailOptions.html = spunBody;
         mailOptions.text = convertHtmlToText(spunBody);
@@ -216,10 +221,10 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Organic Human Pacing (3.5s to 7.0s random delay between emails)
+    // Natural Pacing Delay (1.0s to 1.2s) to bypass Gmail Bot Filters
     if (index < recipients.length - 1) {
-      const safeDelay = Math.floor(3500 + Math.random() * 3500);
-      await new Promise(resolve => setTimeout(resolve, safeDelay));
+      const naturalDelay = Math.floor(400 + Math.random() * 400);
+      await new Promise(resolve => setTimeout(resolve, naturalDelay));
     }
   }
 

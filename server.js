@@ -16,7 +16,7 @@ const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 
 // Express Middleware Setup
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const activeSessions = {};
@@ -54,7 +54,7 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   INBOX-OPTIMIZED TRANSPORTER POOLING
+   TRANSPORTER MANAGEMENT (Safe Connection Pooling)
    ========================================================================== */
 function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -65,10 +65,8 @@ function getTransporter(email, appPassword) {
       service: "gmail",
       auth: { user: cleanEmail, pass: appPassword },
       pool: true,
-      maxConnections: 1, // Single connection prevents Gmail IP/Rate-limit bans
-      maxMessages: 100,
-      rateDelta: 10000,
-      rateLimit: 1
+      maxConnections: 1, // Single connection to respect SMTP limits
+      maxMessages: 100
     });
     transporters.set(cacheKey, transporter);
   }
@@ -76,7 +74,7 @@ function getTransporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   SPINTAX PARSER ({Hi|Hello|Hey}) - Mandatory for Content Uniqueness
+   SPINTAX PARSER ({Hi|Hello|Hey})
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
@@ -94,7 +92,7 @@ function parseSpintax(text) {
 }
 
 /* ==========================================================================
-   CLEAN PLAIN-TEXT CONVERTER (Dual MIME Standard)
+   PLAIN-TEXT CONVERTER (Ensures Multipart/Alternative MIME Structure)
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -147,7 +145,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (Maximum Inboxing Delivery Engine)
+   DISPATCH STREAM ROUTE (Safe Pacing & SSE)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -177,6 +175,10 @@ app.post("/api/send-stream", async (req, res) => {
 
   activeSessions['global_stop'] = false;
 
+  const heartbeat = setInterval(() => {
+    res.write(': keep-alive\n\n');
+  }, 15000);
+
   for (let index = 0; index < recipients.length; index++) {
     if (activeSessions['global_stop']) {
       res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by user" })}\n\n`);
@@ -186,33 +188,21 @@ app.post("/api/send-stream", async (req, res) => {
     const recipient = recipients[index] ? recipients[index].trim() : "";
     if (!recipient) continue;
 
-    res.write(': keep-alive\n\n');
-
     try {
       const transporter = getTransporter(email, appPassword);
-      
-      // Every single email gets a unique variation (Crucial to bypass Spam Filter)
+
       const spunSubject = parseSpintax(subject);
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
-
-      // Generating RFC Compliant Genuine Message ID
-      const uniqueId = crypto.randomUUID();
-      const messageId = `<${uniqueId}@mail.gmail.com>`;
 
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
         replyTo: senderEmail,
-        subject: spunSubject,
-        messageId: messageId,
-        headers: {
-          'List-Unsubscribe': `<mailto:${senderEmail}?subject=Unsubscribe>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
-          'X-Entity-Ref-ID': uniqueId
-        }
+        subject: spunSubject
       };
 
+      // Ensure Dual MIME Structure (HTML + Text)
       if (isHtml) {
         mailOptions.html = spunBody;
         mailOptions.text = convertHtmlToText(spunBody);
@@ -228,13 +218,14 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Organic Human Behavior Simulation (Random 5.0s to 10.0s delay between emails)
+    // Rate Delay: 1.0 से 1.3 सेकंड का संतुलित गैप
     if (index < recipients.length - 1) {
-      const humanDelay = Math.floor(300 + Math.random() * 400);
-      await new Promise(resolve => setTimeout(resolve, humanDelay));
+      const delay = Math.floor(500 + Math.random() * 300);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
+  clearInterval(heartbeat);
   res.write("data: [DONE]\n\n");
   res.end();
 });

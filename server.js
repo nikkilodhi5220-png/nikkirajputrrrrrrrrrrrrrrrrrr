@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import { Resend } from 'resend';
+import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -9,36 +9,50 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-
+const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
-const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 
-// Initialize Resend Client
-const resend = new Resend(RESEND_API_KEY);
+// State Tracker
+const globalSession = { isStopped: false };
+const transporterPool = new Map();
 
-// Express Middleware Setup
+// Middlewares
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const activeSessions = {};
-
 /* ==========================================================================
-   ROOT ROUTE
+   HELPER FUNCTIONS
    ========================================================================== */
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
 
-/* ==========================================================================
-   HELPER: SPINTAX PARSER ({Hi|Hello|Hey})
-   ========================================================================== */
+function getTransporter(email, appPassword) {
+  const cleanEmail = email.toLowerCase().trim();
+  const poolKey = `${cleanEmail}_${appPassword}`;
+
+  if (!transporterPool.has(poolKey)) {
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: cleanEmail,
+        pass: appPassword
+      },
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
+      socketTimeout: 20000
+    });
+    transporterPool.set(poolKey, transporter);
+  }
+
+  return transporterPool.get(poolKey);
+}
+
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
   const regex = /{([^{}]+)}/g;
   let iterations = 0;
+  
   while (regex.test(spun) && iterations < 10) {
     spun = spun.replace(regex, (_, choices) => {
       const options = choices.split('|');
@@ -49,10 +63,7 @@ function parseSpintax(text) {
   return spun;
 }
 
-/* ==========================================================================
-   HELPER: PLAIN-TEXT FALLBACK (Dual MIME for High Deliverability)
-   ========================================================================== */
-function convertHtmlToText(html) {
+function stripHtmlToPlain(html) {
   if (!html) return "";
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -70,90 +81,117 @@ function convertHtmlToText(html) {
 }
 
 /* ==========================================================================
-   SSE STREAM ROUTE (HIGH-INBOX DELIVERABILITY VIA RESEND API)
+   ROUTES
    ========================================================================== */
-app.post("/api/send-stream", async (req, res) => {
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.post('/api/auth', (req, res) => {
+  const { password } = req.body;
+  if (password === SITE_PASSWORD) {
+    return res.json({ success: true, message: "Authorized" });
+  }
+  return res.status(401).json({ success: false, message: "Unauthorized password" });
+});
+
+app.post('/api/verify', async (req, res) => {
+  const { email, appPassword } = req.body;
+  if (!email || !appPassword) {
+    return res.status(400).json({ success: false, message: "Email and App Password required" });
+  }
+
+  try {
+    const transporter = getTransporter(email, appPassword);
+    await transporter.verify();
+    return res.json({ success: true, message: "SMTP credentials verified" });
+  } catch (err) {
+    return res.status(401).json({ success: false, message: "SMTP Connection failed" });
+  }
+});
+
+app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const { fromEmail, senderName, subject, messageBody, recipients } = req.body;
+  const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
 
-  // fromEmail MUST use your verified custom domain (e.g., hello@yourdomain.com)
-  if (!fromEmail || !Array.isArray(recipients) || recipients.length === 0) {
-    res.write(`data: ${JSON.stringify({ success: false, error: "Missing required fields" })}\n\n`);
+  if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
+    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid payload parameters" })}\n\n`);
     res.end();
     return;
   }
 
+  const senderEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-  const formattedFrom = cleanSenderName ? `${cleanSenderName} <${fromEmail}>` : fromEmail;
+  globalSession.isStopped = false;
 
-  activeSessions['global_stop'] = false;
+  const heartbeat = setInterval(() => {
+    res.write(': keep-alive\n\n');
+  }, 10000);
 
-  for (let index = 0; index < recipients.length; index++) {
-    if (activeSessions['global_stop']) {
-      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by user" })}\n\n`);
+  for (let i = 0; i < recipients.length; i++) {
+    if (globalSession.isStopped) {
+      res.write(`data: ${JSON.stringify({ success: false, error: "Process stopped by user" })}\n\n`);
       break;
     }
 
-    const recipient = recipients[index] ? recipients[index].trim() : "";
+    const recipient = recipients[i] ? recipients[i].trim() : "";
     if (!recipient) continue;
 
-    res.write(': keep-alive\n\n');
-
     try {
+      const transporter = getTransporter(email, appPassword);
+      
       const spunSubject = parseSpintax(subject);
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      const payload = {
-        from: formattedFrom,
+      const mailOptions = {
+        from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
+        replyTo: senderEmail,
         subject: spunSubject,
         headers: {
-          'X-Entity-Ref-ID': `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`
+          'List-Unsubscribe': `<mailto:${senderEmail}?subject=Unsubscribe>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
         }
       };
 
       if (isHtml) {
-        payload.html = spunBody;
-        payload.text = convertHtmlToText(spunBody);
+        mailOptions.html = spunBody;
+        mailOptions.text = stripHtmlToPlain(spunBody);
       } else {
-        payload.text = spunBody;
+        mailOptions.text = spunBody;
       }
 
-      // Send via Resend API
-      const response = await resend.emails.send(payload);
-
-      if (response.error) {
-        throw new Error(response.error.message);
-      }
-
-      res.write(`data: ${JSON.stringify({ success: true, recipient, id: response.data.id })}\n\n`);
+      await transporter.sendMail(mailOptions);
+      res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
 
     } catch (error) {
       console.error(`Error sending to ${recipient}:`, error.message);
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Rate-limit safety pause between requests
-    if (index < recipients.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    // SPEED: Exact 1.1s to 1.2s Delay
+    if (i < recipients.length - 1) {
+      const delay = Math.floor(1100 + Math.random() * 100); 
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
+  clearInterval(heartbeat);
   res.write("data: [DONE]\n\n");
   res.end();
 });
 
-/* ==========================================================================
-   STOP ROUTE
-   ========================================================================== */
-app.post("/api/stop", (req, res) => {
-  activeSessions['global_stop'] = true;
-  res.json({ success: true, message: "Stop process registered" });
+app.post('/api/stop', (req, res) => {
+  globalSession.isStopped = true;
+  res.json({ success: true, message: "Stop signal received" });
 });
 
-export default app;
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+});

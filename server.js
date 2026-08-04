@@ -13,63 +13,66 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
-// Session & Transport Cache Management
-const activeState = { stopRequested: false };
-const connectionMap = new Map();
+// Session Tracker & Transporter Pool
+const globalSession = { stopRequested: false };
+const poolMap = new Map();
 
-// Express Configuration
+// Express Middlewares
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   ADVANCED HELPER UTILITIES
+   PORT 587 ENGINE (Explicit TLS & High Security Pool)
    ========================================================================== */
+function getPort587Transporter(email, appPassword) {
+  const key = `port587_${email.toLowerCase().trim()}_${appPassword}`;
 
-// 1. Connection Engine (Prevents IP/Port Throttling)
-function acquireTransport(email, appPassword) {
-  const accountKey = `${email.toLowerCase().trim()}:${appPassword}`;
-
-  if (!connectionMap.has(accountKey)) {
+  if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
-      port: 465,
-      secure: true, // TLS/SSL Protocol Direct Connection
+      port: 587,             // PORT 587 (Explicit TLS)
+      secure: false,        // Port 587 ke liye false hona chahiye
+      requireTLS: true,     // Force Security Handshake
       auth: {
         user: email.toLowerCase().trim(),
         pass: appPassword
       },
       pool: true,
-      maxConnections: 2,
+      maxConnections: 3,    // Fast Processing
       maxMessages: 100,
-      rateLimit: true,
-      rateDelta: 1000
+      tls: {
+        rejectUnauthorized: false,
+        ciphers: 'SSLv3'
+      }
     });
-    connectionMap.set(accountKey, transporter);
+
+    poolMap.set(key, transporter);
   }
 
-  return connectionMap.get(accountKey);
+  return poolMap.get(key);
 }
 
-// 2. Multi-level Spintax Parser
+/* ==========================================================================
+   SPINTAX & CONTENT UTILITIES
+   ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
   const regex = /{([^{}]+)}/g;
-  let depth = 0;
+  let passes = 0;
 
-  while (regex.test(spun) && depth < 8) {
+  while (regex.test(spun) && passes < 10) {
     spun = spun.replace(regex, (_, choices) => {
       const options = choices.split('|');
       return options[Math.floor(Math.random() * options.length)];
     });
-    depth++;
+    passes++;
   }
   return spun;
 }
 
-// 3. RFC-Compliant Plain-Text Normalizer
-function convertToPlainText(html) {
+function createPlainTextFromHtml(html) {
   if (!html) return "";
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -87,41 +90,40 @@ function convertToPlainText(html) {
 }
 
 /* ==========================================================================
-   API ENDPOINTS
+   ROUTES
    ========================================================================== */
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Password Authentication
 app.post('/api/auth', (req, res) => {
   const { password } = req.body;
   if (password === SITE_PASSWORD) {
-    return res.json({ success: true, message: "Authentication Successful" });
+    return res.json({ success: true, message: "Authorized" });
   }
   return res.status(401).json({ success: false, message: "Unauthorized Password" });
 });
 
-// Credentials Verification
 app.post('/api/verify', async (req, res) => {
   const { email, appPassword } = req.body;
   if (!email || !appPassword) {
-    return res.status(400).json({ success: false, message: "Credentials missing" });
+    return res.status(400).json({ success: false, message: "Credentials Missing" });
   }
 
   try {
-    const transporter = acquireTransport(email, appPassword);
+    const transporter = getPort587Transporter(email, appPassword);
     await transporter.verify();
-    return res.json({ success: true, message: "SMTP Handshake Success" });
+    return res.json({ success: true, message: "Port 587 Connection Verified" });
   } catch (err) {
-    return res.status(401).json({ success: false, message: "SMTP Connection Refused" });
+    return res.status(401).json({ success: false, message: "Port 587 Connection Failed" });
   }
 });
 
-// Streaming Mail Dispatcher (Speed: 1.1s - 1.2s)
+/* ==========================================================================
+   STREAMING DISPATCH (Speed: 1.1s - 1.2s on Port 587)
+   ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
-  // Setup Server-Sent Events (SSE)
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -130,25 +132,24 @@ app.post('/api/send-stream', async (req, res) => {
   const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
 
   if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
-    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Payload" })}\n\n`);
+    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Data" })}\n\n`);
     res.end();
     return;
   }
 
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-  activeState.stopRequested = false;
+  globalSession.stopRequested = false;
 
-  // SSE Heartbeat to prevent socket drops
-  const pingInterval = setInterval(() => {
+  const keepAlivePing = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 8000);
+  }, 9000);
 
-  const domain = cleanEmail.split('@')[1] || 'gmail.com';
+  const senderDomain = cleanEmail.split('@')[1] || 'gmail.com';
 
   for (let i = 0; i < recipients.length; i++) {
-    if (activeState.stopRequested) {
-      res.write(`data: ${JSON.stringify({ success: false, error: "Execution Halts by User" })}\n\n`);
+    if (globalSession.stopRequested) {
+      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
       break;
     }
 
@@ -156,72 +157,69 @@ app.post('/api/send-stream', async (req, res) => {
     if (!recipient) continue;
 
     try {
-      const transporter = acquireTransport(email, appPassword);
+      const transporter = getPort587Transporter(email, appPassword);
       
-      // Parse Dynamic Content
-      const finalSubject = parseSpintax(subject);
-      let rawBody = parseSpintax(messageBody);
+      const spunSubject = parseSpintax(subject);
+      let spunBody = parseSpintax(messageBody);
 
-      // Inboxing Hack: Add Unique Reference Tag to bypass Spam Hash Matching
-      const uniqueRef = crypto.randomBytes(4).toString('hex');
-      const isHtml = /<[a-z][\s\S]*>/i.test(rawBody);
+      // Inboxing Tracker Hash Generator
+      const messageHash = crypto.randomBytes(3).toString('hex');
+      const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
       if (isHtml) {
-        rawBody += `<br><br><span style="color:#ffffff;font-size:1px;display:none;">Ref: ${uniqueRef}</span>`;
+        spunBody += `<br><span style="display:none;font-size:1px;color:#ffffff;">id:${messageHash}</span>`;
       } else {
-        rawBody += `\n\n[Ref: ${uniqueRef}]`;
+        spunBody += `\n\n[id:${messageHash}]`;
       }
 
-      // Generate Custom Unique RFC Message-ID
-      const customMessageId = `<${Date.now()}.${uniqueRef}@${domain}>`;
+      // Dynamic Port 587 RFC Message Header
+      const uniqueMsgId = `<${Date.now()}.${messageHash}@${senderDomain}>`;
 
-      const mailData = {
+      const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
         to: recipient,
         replyTo: cleanEmail,
-        subject: finalSubject,
-        messageId: customMessageId,
+        subject: spunSubject,
+        messageId: uniqueMsgId,
         headers: {
-          'X-Entity-Ref-ID': uniqueRef,
+          'X-Delivery-Context': messageHash,
           'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
           'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
         }
       };
 
       if (isHtml) {
-        mailData.html = rawBody;
-        mailData.text = convertToPlainText(rawBody);
+        mailOptions.html = spunBody;
+        mailOptions.text = createPlainTextFromHtml(spunBody);
       } else {
-        mailData.text = rawBody;
+        mailOptions.text = spunBody;
       }
 
-      await transporter.sendMail(mailData);
+      await transporter.sendMail(mailOptions);
       res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
 
     } catch (err) {
-      console.error(`Transmission Error to ${recipient}:`, err.message);
+      console.error(`Port 587 Send Failure to ${recipient}:`, err.message);
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
     }
 
-    // EXACT SPEED DELAY: 1.1s to 1.2s (1100ms - 1200ms)
+    // SPEED: 1.1s to 1.2s (1100ms - 1200ms)
     if (i < recipients.length - 1) {
-      const delay = Math.floor(1100 + Math.random() * 100);
-      await new Promise(resolve => setTimeout(resolve, delay));
+      const exactDelay = Math.floor(1100 + Math.random() * 100);
+      await new Promise(resolve => setTimeout(resolve, exactDelay));
     }
   }
 
-  clearInterval(pingInterval);
+  clearInterval(keepAlivePing);
   res.write("data: [DONE]\n\n");
   res.end();
 });
 
-// Stop Signal Route
 app.post('/api/stop', (req, res) => {
-  activeState.stopRequested = true;
-  res.json({ success: true, message: "Stop signal processed" });
+  globalSession.stopRequested = true;
+  res.json({ success: true, message: "Process stopped successfully" });
 });
 
-// Start Express Server
 app.listen(PORT, () => {
-  console.log(`Inboxing Server operational on port ${PORT}`);
+  console.log(`Server listening on Port ${PORT} using SMTP 587 Engine`);
 });

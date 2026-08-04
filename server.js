@@ -1,78 +1,58 @@
 import 'dotenv/config';
 import express from 'express';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 
-// Session Tracker & Transporter Pool
-const globalSession = { stopRequested: false };
-const poolMap = new Map();
+// Initialize Resend Client
+const resend = new Resend(RESEND_API_KEY);
 
-// Express Middlewares
+// Express Middleware Setup
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
+const activeSessions = {};
+
 /* ==========================================================================
-   PORT 587 ENGINE (Explicit TLS & High Security Pool)
+   ROOT ROUTE
    ========================================================================== */
-function getPort587Transporter(email, appPassword) {
-  const key = `port587_${email.toLowerCase().trim()}_${appPassword}`;
-
-  if (!poolMap.has(key)) {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,             // PORT 587 (Explicit TLS)
-      secure: false,        // Port 587 ke liye false hona chahiye
-      requireTLS: true,     // Force Security Handshake
-      auth: {
-        user: email.toLowerCase().trim(),
-        pass: appPassword
-      },
-      pool: true,
-      maxConnections: 3,    // Fast Processing
-      maxMessages: 100,
-      tls: {
-        rejectUnauthorized: false,
-        ciphers: 'SSLv3'
-      }
-    });
-
-    poolMap.set(key, transporter);
-  }
-
-  return poolMap.get(key);
-}
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 /* ==========================================================================
-   SPINTAX & CONTENT UTILITIES
+   HELPER: SPINTAX PARSER ({Hi|Hello|Hey})
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
   const regex = /{([^{}]+)}/g;
-  let passes = 0;
-
-  while (regex.test(spun) && passes < 10) {
+  let iterations = 0;
+  while (regex.test(spun) && iterations < 10) {
     spun = spun.replace(regex, (_, choices) => {
       const options = choices.split('|');
       return options[Math.floor(Math.random() * options.length)];
     });
-    passes++;
+    iterations++;
   }
   return spun;
 }
 
-function createPlainTextFromHtml(html) {
+/* ==========================================================================
+   HELPER: PLAIN-TEXT FALLBACK (Dual MIME for High Deliverability)
+   ========================================================================== */
+function convertHtmlToText(html) {
   if (!html) return "";
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -90,136 +70,90 @@ function createPlainTextFromHtml(html) {
 }
 
 /* ==========================================================================
-   ROUTES
+   SSE STREAM ROUTE (HIGH-INBOX DELIVERABILITY VIA RESEND API)
    ========================================================================== */
-
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.post('/api/auth', (req, res) => {
-  const { password } = req.body;
-  if (password === SITE_PASSWORD) {
-    return res.json({ success: true, message: "Authorized" });
-  }
-  return res.status(401).json({ success: false, message: "Unauthorized Password" });
-});
-
-app.post('/api/verify', async (req, res) => {
-  const { email, appPassword } = req.body;
-  if (!email || !appPassword) {
-    return res.status(400).json({ success: false, message: "Credentials Missing" });
-  }
-
-  try {
-    const transporter = getPort587Transporter(email, appPassword);
-    await transporter.verify();
-    return res.json({ success: true, message: "Port 587 Connection Verified" });
-  } catch (err) {
-    return res.status(401).json({ success: false, message: "Port 587 Connection Failed" });
-  }
-});
-
-/* ==========================================================================
-   STREAMING DISPATCH (Speed: 1.1s - 1.2s on Port 587)
-   ========================================================================== */
-app.post('/api/send-stream', async (req, res) => {
+app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
+  const { fromEmail, senderName, subject, messageBody, recipients } = req.body;
 
-  if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
-    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Data" })}\n\n`);
+  // fromEmail MUST use your verified custom domain (e.g., hello@yourdomain.com)
+  if (!fromEmail || !Array.isArray(recipients) || recipients.length === 0) {
+    res.write(`data: ${JSON.stringify({ success: false, error: "Missing required fields" })}\n\n`);
     res.end();
     return;
   }
 
-  const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-  globalSession.stopRequested = false;
+  const formattedFrom = cleanSenderName ? `${cleanSenderName} <${fromEmail}>` : fromEmail;
 
-  const keepAlivePing = setInterval(() => {
-    res.write(': keep-alive\n\n');
-  }, 9000);
+  activeSessions['global_stop'] = false;
 
-  const senderDomain = cleanEmail.split('@')[1] || 'gmail.com';
-
-  for (let i = 0; i < recipients.length; i++) {
-    if (globalSession.stopRequested) {
-      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
+  for (let index = 0; index < recipients.length; index++) {
+    if (activeSessions['global_stop']) {
+      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by user" })}\n\n`);
       break;
     }
 
-    const recipient = recipients[i] ? recipients[i].trim() : "";
+    const recipient = recipients[index] ? recipients[index].trim() : "";
     if (!recipient) continue;
 
-    try {
-      const transporter = getPort587Transporter(email, appPassword);
-      
-      const spunSubject = parseSpintax(subject);
-      let spunBody = parseSpintax(messageBody);
+    res.write(': keep-alive\n\n');
 
-      // Inboxing Tracker Hash Generator
-      const messageHash = crypto.randomBytes(3).toString('hex');
+    try {
+      const spunSubject = parseSpintax(subject);
+      const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      if (isHtml) {
-        spunBody += `<br><span style="display:none;font-size:1px;color:#ffffff;">id:${messageHash}</span>`;
-      } else {
-        spunBody += `\n\n[id:${messageHash}]`;
-      }
-
-      // Dynamic Port 587 RFC Message Header
-      const uniqueMsgId = `<${Date.now()}.${messageHash}@${senderDomain}>`;
-
-      const mailOptions = {
-        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+      const payload = {
+        from: formattedFrom,
         to: recipient,
-        replyTo: cleanEmail,
         subject: spunSubject,
-        messageId: uniqueMsgId,
         headers: {
-          'X-Delivery-Context': messageHash,
-          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
+          'X-Entity-Ref-ID': `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`
         }
       };
 
       if (isHtml) {
-        mailOptions.html = spunBody;
-        mailOptions.text = createPlainTextFromHtml(spunBody);
+        payload.html = spunBody;
+        payload.text = convertHtmlToText(spunBody);
       } else {
-        mailOptions.text = spunBody;
+        payload.text = spunBody;
       }
 
-      await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
+      // Send via Resend API
+      const response = await resend.emails.send(payload);
 
-    } catch (err) {
-      console.error(`Port 587 Send Failure to ${recipient}:`, err.message);
-      res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
+      if (response.error) {
+        throw new Error(response.error.message);
+      }
+
+      res.write(`data: ${JSON.stringify({ success: true, recipient, id: response.data.id })}\n\n`);
+
+    } catch (error) {
+      console.error(`Error sending to ${recipient}:`, error.message);
+      res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // SPEED: 1.1s to 1.2s (1100ms - 1200ms)
-    if (i < recipients.length - 1) {
-      const exactDelay = Math.floor(1100 + Math.random() * 100);
-      await new Promise(resolve => setTimeout(resolve, exactDelay));
+    // Rate-limit safety pause between requests
+    if (index < recipients.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
 
-  clearInterval(keepAlivePing);
   res.write("data: [DONE]\n\n");
   res.end();
 });
 
-app.post('/api/stop', (req, res) => {
-  globalSession.stopRequested = true;
-  res.json({ success: true, message: "Process stopped successfully" });
+/* ==========================================================================
+   STOP ROUTE
+   ========================================================================== */
+app.post("/api/stop", (req, res) => {
+  activeSessions['global_stop'] = true;
+  res.json({ success: true, message: "Stop process registered" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on Port ${PORT} using SMTP 587 Engine`);
-});
+export default app;

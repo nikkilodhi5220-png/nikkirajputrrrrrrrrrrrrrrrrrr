@@ -4,74 +4,72 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
-const SITE_PASSWORD = process.env.SITE_PASSWORD || 'N##';
-const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+// Session & Transport Cache Management
+const activeState = { stopRequested: false };
+const connectionMap = new Map();
 
-// Middlewares
+// Express Configuration
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const activeSessions = {};
-const transporters = new Map();
-
 /* ==========================================================================
-   ROOT ROUTE
+   ADVANCED HELPER UTILITIES
    ========================================================================== */
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
 
-/* ==========================================================================
-   SMART TRANSPORTER (Clean Pool & Memory Safe)
-   ========================================================================== */
-function getTransporter(email, appPassword) {
-  const cleanEmail = email.toLowerCase().trim();
-  const cacheKey = `${cleanEmail}_${appPassword}`;
+// 1. Connection Engine (Prevents IP/Port Throttling)
+function acquireTransport(email, appPassword) {
+  const accountKey = `${email.toLowerCase().trim()}:${appPassword}`;
 
-  if (!transporters.has(cacheKey)) {
+  if (!connectionMap.has(accountKey)) {
     const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user: cleanEmail, pass: appPassword },
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true, // TLS/SSL Protocol Direct Connection
+      auth: {
+        user: email.toLowerCase().trim(),
+        pass: appPassword
+      },
       pool: true,
-      maxConnections: 1, // Single socket prevents IP throttling
-      maxMessages: 50,
-      socketTimeout: 30000,
-      connectionTimeout: 15000
+      maxConnections: 2,
+      maxMessages: 100,
+      rateLimit: true,
+      rateDelta: 1000
     });
-    transporters.set(cacheKey, transporter);
+    connectionMap.set(accountKey, transporter);
   }
-  return transporters.get(cacheKey);
+
+  return connectionMap.get(accountKey);
 }
 
-/* ==========================================================================
-   SPINTAX ENGINE ({Hi|Hello|Hey})
-   ========================================================================== */
+// 2. Multi-level Spintax Parser
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
   const regex = /{([^{}]+)}/g;
-  let iterations = 0;
-  while (regex.test(spun) && iterations < 10) {
+  let depth = 0;
+
+  while (regex.test(spun) && depth < 8) {
     spun = spun.replace(regex, (_, choices) => {
       const options = choices.split('|');
       return options[Math.floor(Math.random() * options.length)];
     });
-    iterations++;
+    depth++;
   }
   return spun;
 }
 
-/* ==========================================================================
-   HTML TO CLEAN TEXT CONVERTER (For Dual MIME Compliance)
-   ========================================================================== */
-function buildPlainText(html) {
+// 3. RFC-Compliant Plain-Text Normalizer
+function convertToPlainText(html) {
   if (!html) return "";
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -89,31 +87,41 @@ function buildPlainText(html) {
 }
 
 /* ==========================================================================
-   AUTH ROUTES
+   API ENDPOINTS
    ========================================================================== */
-app.post("/api/auth", (req, res) => {
-  const { password } = req.body;
-  if (password === SITE_PASSWORD) return res.json({ success: true, message: "Access Granted" });
-  return res.status(401).json({ success: false, message: "Invalid Password" });
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.post("/api/verify", async (req, res) => {
+// Password Authentication
+app.post('/api/auth', (req, res) => {
+  const { password } = req.body;
+  if (password === SITE_PASSWORD) {
+    return res.json({ success: true, message: "Authentication Successful" });
+  }
+  return res.status(401).json({ success: false, message: "Unauthorized Password" });
+});
+
+// Credentials Verification
+app.post('/api/verify', async (req, res) => {
   const { email, appPassword } = req.body;
-  if (!email || !appPassword) return res.status(400).json({ success: false, message: "Missing Credentials" });
+  if (!email || !appPassword) {
+    return res.status(400).json({ success: false, message: "Credentials missing" });
+  }
 
   try {
-    const transporter = getTransporter(email, appPassword);
+    const transporter = acquireTransport(email, appPassword);
     await transporter.verify();
-    return res.json({ success: true, message: "SMTP Connected Successfully" });
+    return res.json({ success: true, message: "SMTP Handshake Success" });
   } catch (err) {
-    return res.status(401).json({ success: false, message: "SMTP Verification Failed" });
+    return res.status(401).json({ success: false, message: "SMTP Connection Refused" });
   }
 });
 
-/* ==========================================================================
-   INBOX DISPATCH STREAM (Warm-Up Algorithm)
-   ========================================================================== */
-app.post("/api/send-stream", async (req, res) => {
+// Streaming Mail Dispatcher (Speed: 1.1s - 1.2s)
+app.post('/api/send-stream', async (req, res) => {
+  // Setup Server-Sent Events (SSE)
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -122,24 +130,25 @@ app.post("/api/send-stream", async (req, res) => {
   const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
 
   if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
-    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Data Provided" })}\n\n`);
+    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Payload" })}\n\n`);
     res.end();
     return;
   }
 
-  const senderEmail = email.toLowerCase().trim();
+  const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
+  activeState.stopRequested = false;
 
-  activeSessions['global_stop'] = false;
-
-  // SSE Keep-Alive Ping (Prevents Proxy Timeouts)
-  const heartbeat = setInterval(() => {
+  // SSE Heartbeat to prevent socket drops
+  const pingInterval = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 10000);
+  }, 8000);
+
+  const domain = cleanEmail.split('@')[1] || 'gmail.com';
 
   for (let i = 0; i < recipients.length; i++) {
-    if (activeSessions['global_stop']) {
-      res.write(`data: ${JSON.stringify({ success: false, error: "Process Stopped by User" })}\n\n`);
+    if (activeState.stopRequested) {
+      res.write(`data: ${JSON.stringify({ success: false, error: "Execution Halts by User" })}\n\n`);
       break;
     }
 
@@ -147,60 +156,72 @@ app.post("/api/send-stream", async (req, res) => {
     if (!recipient) continue;
 
     try {
-      const transporter = getTransporter(email, appPassword);
+      const transporter = acquireTransport(email, appPassword);
       
-      const spunSubject = parseSpintax(subject);
-      const spunBody = parseSpintax(messageBody);
-      const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
+      // Parse Dynamic Content
+      const finalSubject = parseSpintax(subject);
+      let rawBody = parseSpintax(messageBody);
 
-      const mailOptions = {
-        from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
+      // Inboxing Hack: Add Unique Reference Tag to bypass Spam Hash Matching
+      const uniqueRef = crypto.randomBytes(4).toString('hex');
+      const isHtml = /<[a-z][\s\S]*>/i.test(rawBody);
+
+      if (isHtml) {
+        rawBody += `<br><br><span style="color:#ffffff;font-size:1px;display:none;">Ref: ${uniqueRef}</span>`;
+      } else {
+        rawBody += `\n\n[Ref: ${uniqueRef}]`;
+      }
+
+      // Generate Custom Unique RFC Message-ID
+      const customMessageId = `<${Date.now()}.${uniqueRef}@${domain}>`;
+
+      const mailData = {
+        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
         to: recipient,
-        replyTo: senderEmail,
-        subject: spunSubject
+        replyTo: cleanEmail,
+        subject: finalSubject,
+        messageId: customMessageId,
+        headers: {
+          'X-Entity-Ref-ID': uniqueRef,
+          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
+        }
       };
 
-      // Ensure Standard Dual-MIME Payload
       if (isHtml) {
-        mailOptions.html = spunBody;
-        mailOptions.text = buildPlainText(spunBody);
+        mailData.html = rawBody;
+        mailData.text = convertToPlainText(rawBody);
       } else {
-        mailOptions.text = spunBody;
+        mailData.text = rawBody;
       }
 
-      await transporter.sendMail(mailOptions);
+      await transporter.sendMail(mailData);
       res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
 
-    } catch (error) {
-      console.error(`Failed to send to ${recipient}:`, error.message);
-      res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
+    } catch (err) {
+      console.error(`Transmission Error to ${recipient}:`, err.message);
+      res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
     }
 
-    // Dynamic Human-like Delay Logic
+    // EXACT SPEED DELAY: 1.1s to 1.2s (1100ms - 1200ms)
     if (i < recipients.length - 1) {
-      // Basic Delay: 2.0s to 2.1s
-      let delay = Math.floor(400 + Math.random() * 300);
-
-      // Warm-Up Cooldown: Har 10 Mails ke baad extra 15-20 Second ka ब्रेक (Bot Trap se bachne ke liye)
-      if ((i + 1) % 10 === 0) {
-        delay += Math.floor(15000 + Math.random() * 5000);
-      }
-
+      const delay = Math.floor(1100 + Math.random() * 100);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
-  clearInterval(heartbeat);
+  clearInterval(pingInterval);
   res.write("data: [DONE]\n\n");
   res.end();
 });
 
-/* ==========================================================================
-   STOP ROUTE
-   ========================================================================== */
-app.post("/api/stop", (req, res) => {
-  activeSessions['global_stop'] = true;
-  res.json({ success: true, message: "Stopping Execution" });
+// Stop Signal Route
+app.post('/api/stop', (req, res) => {
+  activeState.stopRequested = true;
+  res.json({ success: true, message: "Stop signal processed" });
 });
 
-export default app;
+// Start Express Server
+app.listen(PORT, () => {
+  console.log(`Inboxing Server operational on port ${PORT}`);
+});

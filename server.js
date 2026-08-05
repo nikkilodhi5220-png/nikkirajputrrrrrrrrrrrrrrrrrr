@@ -146,9 +146,9 @@ class EmailQueueEngine {
 
       // Dynamic Intelligent Delay (1 to 1.2 Seconds + Cooloff)
       if (this.queue.length > 0 && !this.isStopped) {
-        let baseDelay = Math.floor(200 + Math.random() * 200);
+        let baseDelay = Math.floor(2000 + Math.random() * 2000);
         if (sentCount % 10 === 0) {
-          baseDelay += 10000; // 25 सेकंड का कूल-ऑफ ब्रेक
+          baseDelay += 10000; // 10 सेकंड का कूल-ऑफ ब्रेक
         }
         await new Promise(res => setTimeout(res, baseDelay));
       }

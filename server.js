@@ -13,58 +13,42 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
-// Multi-Session Engine & Transporter Pool
-const activeSessions = new Set();
+const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
-// Middlewares
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   1. UNIQUE CODE GENERATOR (Inboxing & Fingerprint Avoidance)
+   EXACT ID GENERATOR (Outputs: [id:0c35ce])
    ========================================================================== */
-/**
- * Har mail ke liye Unique Format Code banata hai
- * Example Formats: REF-8X9A2K, TRK-94218, SEC-3M7P0Q
- */
-function generateUniqueCode(prefix = 'REF', length = 6) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Readable characters
-  let randomStr = '';
-  const bytes = crypto.randomBytes(length);
-  for (let i = 0; i < length; i++) {
-    randomStr += chars[bytes[i] % chars.length];
-  }
-  return `${prefix}-${randomStr}`;
+function generateShortMessageId() {
+  // 3 bytes = 6 hex characters (e.g. 0c35ce)
+  const randomHex = crypto.randomBytes(3).toString('hex');
+  return `[id:${randomHex}]`;
 }
 
 /* ==========================================================================
-   2. PORT 587 TRANSPORTER POOL (Modern TLS)
+   OPTIMIZED PORT 587 TRANSPORTER (Clean Headers & Standard TLS)
    ========================================================================== */
-function getPort587Transporter(email, appPassword) {
+function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
-  const key = `port587_${cleanEmail}_${appPassword}`;
+  const key = `smtp_${cleanEmail}_${appPassword}`;
 
   if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
       port: 587,
-      secure: false,       // STARTTLS
+      secure: false,        // Standard STARTTLS
       requireTLS: true,
       auth: {
         user: cleanEmail,
         pass: appPassword
       },
       pool: true,
-      maxConnections: 3,
-      maxMessages: 100,
-      tls: {
-        rejectUnauthorized: true,
-        minVersion: 'TLSv1.2'
-      },
-      connectionTimeout: 15000,
-      socketTimeout: 30000
+      maxConnections: 3,    // Fast and safe connection limit
+      maxMessages: 100
     });
 
     poolMap.set(key, transporter);
@@ -74,7 +58,7 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   3. SPINTAX & TEXT CLEANER UTILITIES
+   SPINTAX & PLAIN TEXT CONVERTER
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
@@ -110,7 +94,7 @@ function createPlainTextFromHtml(html) {
 }
 
 /* ==========================================================================
-   4. ROUTES
+   ROUTES
    ========================================================================== */
 
 app.get('/', (req, res) => {
@@ -132,16 +116,16 @@ app.post('/api/verify', async (req, res) => {
   }
 
   try {
-    const transporter = getPort587Transporter(email, appPassword);
+    const transporter = getTransporter(email, appPassword);
     await transporter.verify();
-    return res.json({ success: true, message: "Port 587 Connection Verified" });
+    return res.json({ success: true, message: "SMTP Connection Verified" });
   } catch (err) {
-    return res.status(401).json({ success: false, message: `Connection Failed: ${err.message}` });
+    return res.status(401).json({ success: false, message: "Connection Failed" });
   }
 });
 
 /* ==========================================================================
-   5. STREAMING DISPATCH (Inboxing Engine with Unique Code per Mail)
+   HIGH INBOXING STREAM DISPATCH (Dynamic ID Tagging)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -149,7 +133,7 @@ app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const { email, appPassword, senderName, subject, messageBody, recipients, sessionId, codePrefix } = req.body;
+  const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
 
   if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
     res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Data" })}\n\n`);
@@ -157,27 +141,18 @@ app.post('/api/send-stream', async (req, res) => {
     return;
   }
 
-  const currentSessionId = sessionId || `session_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  activeSessions.add(currentSessionId);
-
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-  const senderDomain = cleanEmail.split('@')[1] || 'gmail.com';
-  const prefix = (codePrefix || 'REF').toUpperCase().trim();
+  globalSession.stopRequested = false;
 
   const keepAlivePing = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 9000);
+  }, 4000);
 
-  let clientDisconnected = false;
-  req.on('close', () => {
-    clientDisconnected = true;
-    activeSessions.delete(currentSessionId);
-    clearInterval(keepAlivePing);
-  });
+  const transporter = getTransporter(email, appPassword);
 
   for (let i = 0; i < recipients.length; i++) {
-    if (!activeSessions.has(currentSessionId) || clientDisconnected) {
+    if (globalSession.stopRequested) {
       res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
       break;
     }
@@ -186,108 +161,60 @@ app.post('/api/send-stream', async (req, res) => {
     if (!recipient) continue;
 
     try {
-      const transporter = getPort587Transporter(email, appPassword);
-      
-      // A. HAR EMAIL KE LIYE UNIQUE CODE GENERATE HO RAHA HAI
-      const uniqueCode = generateUniqueCode(prefix, 6); // Output e.g: REF-8K2P9X
-      const trackingHash = crypto.randomBytes(4).toString('hex');
+      // 1. Generate Unique Format ID e.g., [id:0c35ce]
+      const uniqueIdTag = generateShortMessageId();
 
-      // B. Spintax Process
-      let spunSubject = parseSpintax(subject);
+      const spunSubject = parseSpintax(subject);
       let spunBody = parseSpintax(messageBody);
 
-      // C. Replace Code Placeholders ({CODE} ya [[CODE]]) in Subject & Body
-      spunSubject = spunSubject
-        .replace(/{CODE}/g, uniqueCode)
-        .replace(/\[\[CODE\]\]/g, uniqueCode)
-        .replace(/{REF}/g, uniqueCode);
-
-      spunBody = spunBody
-        .replace(/{CODE}/g, uniqueCode)
-        .replace(/\[\[CODE\]\]/g, uniqueCode)
-        .replace(/{REF}/g, uniqueCode);
-
-      // D. HTML Inboxing Enhancements (Auto Footer with Unique Code if missing)
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
+      let finalBodyHtml = "";
+      let finalBodyText = "";
+
+      // 2. Append [id:0c35ce] tag cleanly at the bottom of body
       if (isHtml) {
-        // Aesthetic & Anti-Spam Footer Injection
-        spunBody += `
-          <br><br>
-          <div style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #f0f0f0; font-family: monospace, sans-serif; font-size: 11px; color: #888888;">
-            Reference Code: <strong style="color:#444444;">${uniqueCode}</strong> | Security Hash: <span>${trackingHash}</span>
-          </div>
-          <span style="display:none;font-size:1px;color:#ffffff;">[id:${trackingHash}]</span>
-        `;
+        finalBodyHtml = `${spunBody}<br><br><p style="color:#777777;font-size:12px;margin-top:15px;">${uniqueIdTag}</p>`;
+        finalBodyText = `${createPlainTextFromHtml(spunBody)}\n\n${uniqueIdTag}`;
       } else {
-        spunBody += `\n\n-------------------------\nReference Code: ${uniqueCode}\nRef Hash: ${trackingHash}`;
+        finalBodyText = `${spunBody}\n\n${uniqueIdTag}`;
       }
 
-      // E. Unique Message-ID & Compliant Headers
-      const uniqueMsgId = `<${Date.now()}.${uniqueCode.replace('-', '')}@${senderDomain}>`;
-
+      // 3. Clean RFC Compliant Headers (Passes DKIM and SPF checks)
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
         to: recipient,
         replyTo: cleanEmail,
         subject: spunSubject,
-        messageId: uniqueMsgId,
-        headers: {
-          'X-Entity-Ref-ID': uniqueCode,
-          'X-Delivery-Context': trackingHash,
-          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
-        }
+        text: finalBodyText,
+        ...(isHtml && { html: finalBodyHtml })
       };
 
-      if (isHtml) {
-        mailOptions.html = spunBody;
-        mailOptions.text = createPlainTextFromHtml(spunBody);
-      } else {
-        mailOptions.text = spunBody;
-      }
-
       await transporter.sendMail(mailOptions);
-
-      // Send Success Event with Generated Code
-      res.write(`data: ${JSON.stringify({ 
-        success: true, 
-        recipient, 
-        generatedCode: uniqueCode,
-        sessionId: currentSessionId 
-      })}\n\n`);
+      res.write(`data: ${JSON.stringify({ success: true, recipient, messageIdTag: uniqueIdTag })}\n\n`);
 
     } catch (err) {
-      console.error(`Send Failure to ${recipient}:`, err.message);
+      console.error(`Send Error (${recipient}):`, err.message);
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
     }
 
-    // Dynamic Human-like Delay (1.2s - 1.5s)
-    if (i < recipients.length - 1 && activeSessions.has(currentSessionId) && !clientDisconnected) {
-      const exactDelay = Math.floor(1200 + Math.random() * 300);
-      await new Promise(resolve => setTimeout(resolve, exactDelay));
+    // Dynamic Pace (1.0s to 2.0s Delay) - Best balance for high speed + inbox deliverability
+    if (i < recipients.length - 1) {
+      const safeDelay = Math.floor(1000 + Math.random() * 750);
+      await new Promise(resolve => setTimeout(resolve, safeDelay));
     }
   }
 
-  activeSessions.delete(currentSessionId);
   clearInterval(keepAlivePing);
-  
-  if (!clientDisconnected) {
-    res.write("data: [DONE]\n\n");
-    res.end();
-  }
+  res.write("data: [DONE]\n\n");
+  res.end();
 });
 
 app.post('/api/stop', (req, res) => {
-  const { sessionId } = req.body;
-  if (sessionId) {
-    activeSessions.delete(sessionId);
-  } else {
-    activeSessions.clear();
-  }
+  globalSession.stopRequested = true;
   res.json({ success: true, message: "Process stopped successfully" });
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on Port ${PORT} with Auto Code Generator & Inboxing Engine`);
+  console.log(`Server listening on Port ${PORT}`);
 });

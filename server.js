@@ -10,65 +10,91 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
-// Session Tracker & Transporter Pool
-const globalSession = { stopRequested: false };
-const poolMap = new Map();
+const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+
+// Global Session Tracker & Transporter Cache
+const activeSessions = { stopRequested: false };
+const transporters = new Map();
 
 // Express Middlewares
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   SECURE PORT 587 ENGINE (Standard TLS 1.2/1.3)
+   HELPER: CLOUDFLARE TURNSTILE VERIFICATION
    ========================================================================== */
-function getPort587Transporter(email, appPassword) {
-  const key = `port587_${email.toLowerCase().trim()}_${appPassword}`;
+async function verifyTurnstile(token, ip) {
+  if (!TURNSTILE_SECRET_KEY) return true; // Secret key na hone par bypass
+  if (!token) return false;
 
-  if (!poolMap.has(key)) {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false, // TLS StartTLS ke liye false
-      requireTLS: true,
-      auth: {
-        user: email.toLowerCase().trim(),
-        pass: appPassword
-      },
-      pool: true,
-      maxConnections: 2, // Stable velocity for Gmail
-      maxMessages: 50,
-      // REMOVED: SSLv3 aur rejectUnauthorized: false (Security Fix)
+  try {
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        secret: TURNSTILE_SECRET_KEY,
+        response: token,
+        remoteip: ip || ''
+      })
     });
-
-    poolMap.set(key, transporter);
+    const data = await response.json();
+    return data.success;
+  } catch (error) {
+    console.error("Turnstile Verification Error:", error.message);
+    return false;
   }
-
-  return poolMap.get(key);
 }
 
 /* ==========================================================================
-   SPINTAX & CONTENT UTILITIES
+   TRANSPORTER POOLING (Gmail SMTP Engine)
+   ========================================================================== */
+function getTransporter(email, appPassword) {
+  const cleanEmail = email.toLowerCase().trim();
+  const cacheKey = `${cleanEmail}_${appPassword}`;
+
+  if (!transporters.has(cacheKey)) {
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { 
+        user: cleanEmail, 
+        pass: appPassword 
+      },
+      pool: true,
+      maxConnections: 2,
+      maxMessages: 50
+    });
+    transporters.set(cacheKey, transporter);
+  }
+  return transporters.get(cacheKey);
+}
+
+/* ==========================================================================
+   SPINTAX PARSER ({Hi|Hello|Hey})
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
   const regex = /{([^{}]+)}/g;
-  let passes = 0;
+  let iterations = 0;
 
-  while (regex.test(spun) && passes < 10) {
+  while (regex.test(spun) && iterations < 10) {
     spun = spun.replace(regex, (_, choices) => {
       const options = choices.split('|');
       return options[Math.floor(Math.random() * options.length)];
     });
-    passes++;
+    iterations++;
   }
   return spun;
 }
 
-function createPlainTextFromHtml(html) {
+/* ==========================================================================
+   PLAIN-TEXT CONVERTER FROM HTML
+   ========================================================================== */
+function convertHtmlToText(html) {
   if (!html) return "";
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -89,86 +115,105 @@ function createPlainTextFromHtml(html) {
    ROUTES
    ========================================================================== */
 
+// Root Route
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.post('/api/auth', (req, res) => {
+// Authentication Route
+app.post("/api/auth", (req, res) => {
   const { password } = req.body;
-  if (password === SITE_PASSWORD) {
-    return res.json({ success: true, message: "Authorized" });
+  if (!password) {
+    return res.status(400).json({ success: false, message: "Password is required" });
   }
-  return res.status(401).json({ success: false, message: "Unauthorized Password" });
+  if (password === SITE_PASSWORD) {
+    return res.json({ success: true, message: "Access granted" });
+  }
+  return res.status(401).json({ success: false, message: "Incorrect password" });
 });
 
-app.post('/api/verify', async (req, res) => {
-  const { email, appPassword } = req.body;
+// SMTP Verification Route
+app.post("/api/verify", async (req, res) => {
+  const { email, appPassword, cfToken } = req.body;
+
   if (!email || !appPassword) {
-    return res.status(400).json({ success: false, message: "Credentials Missing" });
+    return res.status(400).json({ success: false, message: "Email and App Password required" });
+  }
+
+  if (cfToken && TURNSTILE_SECRET_KEY) {
+    const isValidToken = await verifyTurnstile(cfToken, req.ip);
+    if (!isValidToken) {
+      return res.status(400).json({ success: false, message: "Security check failed." });
+    }
   }
 
   try {
-    const transporter = getPort587Transporter(email, appPassword);
+    const transporter = getTransporter(email, appPassword);
     await transporter.verify();
-    return res.json({ success: true, message: "Port 587 Connection Verified" });
-  } catch (err) {
-    return res.status(401).json({ success: false, message: "Port 587 Connection Failed" });
+    return res.json({ success: true, message: "SMTP connection verified successfully" });
+  } catch (error) {
+    return res.status(401).json({ success: false, message: "Authentication failed. Check App Password." });
   }
 });
 
-/* ==========================================================================
-   STREAMING DISPATCH (Safe Delay: 3s - 5s)
-   ========================================================================== */
-app.post('/api/send-stream', async (req, res) => {
+// SSE Streaming Sending Route
+app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
+  const { email, appPassword, senderName, subject, messageBody, recipients, cfToken } = req.body;
 
   if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
-    res.write(`data: ${JSON.stringify({ success: false, error: "Invalid Data" })}\n\n`);
+    res.write(`data: ${JSON.stringify({ success: false, error: "Missing required fields" })}\n\n`);
     res.end();
     return;
   }
 
-  const cleanEmail = email.toLowerCase().trim();
+  if (cfToken && TURNSTILE_SECRET_KEY) {
+    const isValidToken = await verifyTurnstile(cfToken, req.ip);
+    if (!isValidToken) {
+      res.write(`data: ${JSON.stringify({ success: false, error: "Turnstile verification failed" })}\n\n`);
+      res.end();
+      return;
+    }
+  }
+
+  const senderEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-  globalSession.stopRequested = false;
 
-  const keepAlivePing = setInterval(() => {
+  activeSessions.stopRequested = false;
+
+  // Connection keep-alive ping interval
+  const keepAliveInterval = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 9000);
+  }, 5000);
 
-  for (let i = 0; i < recipients.length; i++) {
-    if (globalSession.stopRequested) {
-      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
+  for (let index = 0; index < recipients.length; index++) {
+    if (activeSessions.stopRequested) {
+      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by user" })}\n\n`);
       break;
     }
 
-    const recipient = recipients[i] ? recipients[i].trim() : "";
+    const recipient = recipients[index] ? recipients[index].trim() : "";
     if (!recipient) continue;
 
     try {
-      const transporter = getPort587Transporter(email, appPassword);
-      
+      const transporter = getTransporter(email, appPassword);
       const spunSubject = parseSpintax(subject);
       const spunBody = parseSpintax(messageBody);
-
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
       const mailOptions = {
-        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+        from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
-        replyTo: cleanEmail,
-        subject: spunSubject,
-        // REMOVED: Custom messageId & fake tracking headers to allow valid DKIM authentication
+        subject: spunSubject
       };
 
       if (isHtml) {
         mailOptions.html = spunBody;
-        mailOptions.text = createPlainTextFromHtml(spunBody);
+        mailOptions.text = convertHtmlToText(spunBody);
       } else {
         mailOptions.text = spunBody;
       }
@@ -176,28 +221,36 @@ app.post('/api/send-stream', async (req, res) => {
       await transporter.sendMail(mailOptions);
       res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
 
-    } catch (err) {
-      console.error(`Send Failure to ${recipient}:`, err.message);
-      res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
+    } catch (error) {
+      console.error(`Error sending to ${recipient}:`, error.message);
+      res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // SAFE DELAY: 1.5s to 1s per email to prevent Gmail Rate Limit / Spam Flag
-    if (i < recipients.length - 1) {
-      const safeDelay = Math.floor(350 + Math.random() * 150);
-      await new Promise(resolve => setTimeout(resolve, safeDelay));
+    // Dynamic Paced Delay between emails (1.5s to 2s)
+    if (index < recipients.length - 1) {
+      const delayMs = Math.floor(2500 + Math.random() * 1500);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
 
-  clearInterval(keepAlivePing);
+  clearInterval(keepAliveInterval);
   res.write("data: [DONE]\n\n");
   res.end();
 });
 
-app.post('/api/stop', (req, res) => {
-  globalSession.stopRequested = true;
-  res.json({ success: true, message: "Process stopped successfully" });
+// Stop Route
+app.post("/api/stop", (req, res) => {
+  activeSessions.stopRequested = true;
+  res.json({ success: true, message: "Process stop requested" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on Port ${PORT} using Secure SMTP Engine`);
-});
+/* ==========================================================================
+   SERVER INITIALIZATION & VERCEL EXPORT
+   ========================================================================== */
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+export default app;

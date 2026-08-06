@@ -226,9 +226,9 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Dynamic Paced Delay between emails (1.5s to 2s)
+    // Dynamic Paced Delay between emails (1.0s to 1.2s)
     if (index < recipients.length - 1) {
-      const delayMs = Math.floor(2500 + Math.random() * 1500);
+      const delayMs = Math.floor(400 + Math.random() * 300);
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }

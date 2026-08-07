@@ -200,7 +200,7 @@ app.post('/api/send-stream', async (req, res) => {
 
     // Dynamic Pace (1.0s to 2.5s Delay) - Best balance for high speed + inbox deliverability
     if (i < recipients.length - 1) {
-      const safeDelay = Math.floor(200 + Math.random() * 150);
+      const safeDelay = Math.floor(400 + Math.random() * 300);
       await new Promise(resolve => setTimeout(resolve, safeDelay));
     }
   }

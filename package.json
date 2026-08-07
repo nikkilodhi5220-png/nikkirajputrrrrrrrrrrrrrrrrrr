@@ -1,32 +1,15 @@
 {
-  "name": "mail-dispatch-service",
-  "version": "1.1.0",
-  "description": "Enterprise-grade transactional email dispatch console with SSE streaming",
-  "private": true,
+  "name": "bulk-email-sender",
+  "version": "1.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.2",
-    "nodemailer": "^6.9.15"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.10.0"
-  },
-  "keywords": [
-    "email",
-    "smtp",
-    "nodemailer",
-    "sse-stream",
-    "dispatch-console"
-  ]
+    "express": "^4.19.2",
+    "nodemailer": "^6.9.13"
+  }
 }

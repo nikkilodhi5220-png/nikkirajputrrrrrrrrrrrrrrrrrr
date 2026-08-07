@@ -229,9 +229,9 @@ app.post('/api/send-stream', async (req, res) => {
           res.write(': keep-alive\n\n');
         }
       } 
-      // 2. Standard Natural Delay: Har mail ke baad 4s se 7s ka gap
+      // 2. Standard Natural Delay: Har mail ke baad 1.0s se 1.8s ka gap
       else {
-        const perMailDelayMs = Math.floor(4000 + Math.random() * 3000);
+        const perMailDelayMs = Math.floor(600 + Math.random() * 400);
         const delaySeconds = Math.floor(perMailDelayMs / 1000);
 
         for (let d = 0; d < delaySeconds; d++) {

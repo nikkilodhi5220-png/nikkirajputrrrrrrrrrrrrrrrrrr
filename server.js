@@ -13,53 +13,26 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
+// Global Session & Transporter Pool
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
+// Middlewares
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   EXACT ID GENERATOR (Outputs: [id:0c35ce])
+   1. UNIQUE ID & UTILITY FUNCTIONS
    ========================================================================== */
+
+// Outputs format like: [id:0c35ce]
 function generateShortMessageId() {
-  // 3 bytes = 6 hex characters (e.g. 0c35ce)
   const randomHex = crypto.randomBytes(3).toString('hex');
   return `[id:${randomHex}]`;
 }
 
-/* ==========================================================================
-   OPTIMIZED PORT 587 TRANSPORTER (Clean Headers & Standard TLS)
-   ========================================================================== */
-function getTransporter(email, appPassword) {
-  const cleanEmail = email.toLowerCase().trim();
-  const key = `smtp_${cleanEmail}_${appPassword}`;
-
-  if (!poolMap.has(key)) {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,        // Standard STARTTLS
-      requireTLS: true,
-      auth: {
-        user: cleanEmail,
-        pass: appPassword
-      },
-      pool: true,
-      maxConnections: 3,    // Fast and safe connection limit
-      maxMessages: 100
-    });
-
-    poolMap.set(key, transporter);
-  }
-
-  return poolMap.get(key);
-}
-
-/* ==========================================================================
-   SPINTAX & PLAIN TEXT CONVERTER
-   ========================================================================== */
+// Spintax Processor: {Hello|Hi|Hey}
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
@@ -76,6 +49,7 @@ function parseSpintax(text) {
   return spun;
 }
 
+// HTML to Clean Plain Text Converter
 function createPlainTextFromHtml(html) {
   if (!html) return "";
   return html
@@ -94,7 +68,35 @@ function createPlainTextFromHtml(html) {
 }
 
 /* ==========================================================================
-   ROUTES
+   2. SMTP TRANSPORTER (PORT 587 WITH POOLING)
+   ========================================================================== */
+function getPort587Transporter(email, appPassword) {
+  const cleanEmail = email.toLowerCase().trim();
+  const key = `smtp_${cleanEmail}_${appPassword}`;
+
+  if (!poolMap.has(key)) {
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false, // STARTTLS
+      requireTLS: true,
+      auth: {
+        user: cleanEmail,
+        pass: appPassword
+      },
+      pool: true,
+      maxConnections: 2,
+      maxMessages: 50
+    });
+
+    poolMap.set(key, transporter);
+  }
+
+  return poolMap.get(key);
+}
+
+/* ==========================================================================
+   3. ROUTES
    ========================================================================== */
 
 app.get('/', (req, res) => {
@@ -116,7 +118,7 @@ app.post('/api/verify', async (req, res) => {
   }
 
   try {
-    const transporter = getTransporter(email, appPassword);
+    const transporter = getPort587Transporter(email, appPassword);
     await transporter.verify();
     return res.json({ success: true, message: "SMTP Connection Verified" });
   } catch (err) {
@@ -125,7 +127,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   HIGH INBOXING STREAM DISPATCH (Dynamic ID Tagging)
+   4. INBOX-OPTIMIZED DISPATCH ENGINE (SSE STREAM)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -149,7 +151,7 @@ app.post('/api/send-stream', async (req, res) => {
     res.write(': keep-alive\n\n');
   }, 4000);
 
-  const transporter = getTransporter(email, appPassword);
+  const transporter = getPort587Transporter(email, appPassword);
 
   for (let i = 0; i < recipients.length; i++) {
     if (globalSession.stopRequested) {
@@ -161,33 +163,47 @@ app.post('/api/send-stream', async (req, res) => {
     if (!recipient) continue;
 
     try {
-      // 1. Generate Unique Format ID e.g., [id:0c35ce]
+      // Unique Tag Generation
       const uniqueIdTag = generateShortMessageId();
-
       const spunSubject = parseSpintax(subject);
-      let spunBody = parseSpintax(messageBody);
+      const spunBody = parseSpintax(messageBody);
 
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
+
+      // Standard Unsubscribe & Reference Footer
+      const footerHtml = `
+        <br><br>
+        <hr style="border:none;border-top:1px solid #eeeeee;margin-top:20px;">
+        <p style="font-size:11px;color:#777777;font-family:sans-serif;line-height:1.4;">
+          If you no longer wish to receive these emails, reply with "UNSUBSCRIBE".<br>
+          Reference Code: <strong>${uniqueIdTag}</strong>
+        </p>`;
+
+      const footerText = `\n\n---\nTo unsubscribe, reply with "UNSUBSCRIBE".\nReference Code: ${uniqueIdTag}`;
 
       let finalBodyHtml = "";
       let finalBodyText = "";
 
-      // 2. Append [id:0c35ce] tag cleanly at the bottom of body
       if (isHtml) {
-        finalBodyHtml = `${spunBody}<br><br><p style="color:#777777;font-size:12px;margin-top:15px;">${uniqueIdTag}</p>`;
-        finalBodyText = `${createPlainTextFromHtml(spunBody)}\n\n${uniqueIdTag}`;
+        finalBodyHtml = spunBody + footerHtml;
+        finalBodyText = createPlainTextFromHtml(spunBody) + footerText;
       } else {
-        finalBodyText = `${spunBody}\n\n${uniqueIdTag}`;
+        finalBodyText = spunBody + footerText;
       }
 
-      // 3. Clean RFC Compliant Headers (Passes DKIM and SPF checks)
+      // RFC Standard Anti-Spam Headers
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
         to: recipient,
         replyTo: cleanEmail,
         subject: spunSubject,
         text: finalBodyText,
-        ...(isHtml && { html: finalBodyHtml })
+        ...(isHtml && { html: finalBodyHtml }),
+        headers: {
+          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+          'X-Entity-Ref-ID': uniqueIdTag.replace(/\[|\]|id:/g, '')
+        }
       };
 
       await transporter.sendMail(mailOptions);
@@ -198,10 +214,32 @@ app.post('/api/send-stream', async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
     }
 
-    // Dynamic Pace (1.0s to 2.5s Delay) - Best balance for high speed + inbox deliverability
+    // DELAY & BATCH WARMUP PAUSE LOGIC
     if (i < recipients.length - 1) {
-      const safeDelay = Math.floor(400 + Math.random() * 300);
-      await new Promise(resolve => setTimeout(resolve, safeDelay));
+      const currentMailNumber = i + 1;
+
+      // 1. Batch Warmup Pause: Har 15 mails ke baad 15-20 sec ka pause
+      if (currentMailNumber % 15 === 0) {
+        const batchPauseMs = Math.floor(15000 + Math.random() * 5000);
+        const pauseSeconds = Math.floor(batchPauseMs / 1000);
+
+        for (let p = 0; p < pauseSeconds; p++) {
+          if (globalSession.stopRequested) break;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          res.write(': keep-alive\n\n');
+        }
+      } 
+      // 2. Standard Natural Delay: Har mail ke baad 4s se 7s ka gap
+      else {
+        const perMailDelayMs = Math.floor(4000 + Math.random() * 3000);
+        const delaySeconds = Math.floor(perMailDelayMs / 1000);
+
+        for (let d = 0; d < delaySeconds; d++) {
+          if (globalSession.stopRequested) break;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          res.write(': keep-alive\n\n');
+        }
+      }
     }
   }
 
@@ -216,5 +254,5 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on Port ${PORT}`);
+  console.log(`Inboxing-Optimized Server listening on Port ${PORT}`);
 });

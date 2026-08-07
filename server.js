@@ -21,45 +21,13 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   EXACT ID GENERATOR (Outputs: [id:0c35ce])
+   HELPER UTILITIES
    ========================================================================== */
-function generateShortMessageId() {
-  // 3 bytes = 6 hex characters (e.g. 0c35ce)
-  const randomHex = crypto.randomBytes(3).toString('hex');
-  return `[id:${randomHex}]`;
+function generateMessageId() {
+  const hex = crypto.randomBytes(4).toString('hex');
+  return `ref-${hex}`;
 }
 
-/* ==========================================================================
-   OPTIMIZED PORT 587 TRANSPORTER (Clean Headers & Standard TLS)
-   ========================================================================== */
-function getTransporter(email, appPassword) {
-  const cleanEmail = email.toLowerCase().trim();
-  const key = `smtp_${cleanEmail}_${appPassword}`;
-
-  if (!poolMap.has(key)) {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,        // Standard STARTTLS
-      requireTLS: true,
-      auth: {
-        user: cleanEmail,
-        pass: appPassword
-      },
-      pool: true,
-      maxConnections: 3,    // Fast and safe connection limit
-      maxMessages: 100
-    });
-
-    poolMap.set(key, transporter);
-  }
-
-  return poolMap.get(key);
-}
-
-/* ==========================================================================
-   SPINTAX & PLAIN TEXT CONVERTER
-   ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
@@ -87,10 +55,36 @@ function createPlainTextFromHtml(html) {
     .replace(/<[^>]*>/g, '')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
     .replace(/\n\s*\n/g, '\n\n')
     .trim();
+}
+
+/* ==========================================================================
+   TRANSPORTER CONFIG
+   ========================================================================== */
+function getTransporter(email, appPassword) {
+  const cleanEmail = email.toLowerCase().trim();
+  const key = `smtp_${cleanEmail}_${appPassword}`;
+
+  if (!poolMap.has(key)) {
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false, // TLS via STARTTLS
+      requireTLS: true,
+      auth: {
+        user: cleanEmail,
+        pass: appPassword
+      },
+      pool: true,
+      maxConnections: 1, // Single connection to mimic human activity
+      maxMessages: 50
+    });
+
+    poolMap.set(key, transporter);
+  }
+
+  return poolMap.get(key);
 }
 
 /* ==========================================================================
@@ -125,7 +119,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   HIGH INBOXING STREAM DISPATCH (Dynamic ID Tagging)
+   HIGH INBOXING STREAM DISPATCH
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -161,47 +155,67 @@ app.post('/api/send-stream', async (req, res) => {
     if (!recipient) continue;
 
     try {
-      // 1. Generate Unique Format ID e.g., [id:0c35ce]
-      const uniqueIdTag = generateShortMessageId();
-
+      const refId = generateMessageId();
       const spunSubject = parseSpintax(subject);
       let spunBody = parseSpintax(messageBody);
 
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
+      // Mandatory Unsubscribe Footer (Anti-Spam Filter Policy)
+      const unsubscribeFooterHtml = `
+        <br><br>
+        <hr style="border:none;border-top:1px solid #e0e0e0;margin-top:20px;">
+        <p style="font-size:11px;color:#888888;font-family:sans-serif;">
+          If you no longer wish to receive these emails, reply with "UNSUBSCRIBE" to opt-out.<br>
+          Ref ID: [${refId}]
+        </p>`;
+
+      const unsubscribeFooterText = `\n\n---\nTo unsubscribe, reply with "UNSUBSCRIBE".\nRef ID: [${refId}]`;
+
       let finalBodyHtml = "";
       let finalBodyText = "";
 
-      // 2. Append [id:0c35ce] tag cleanly at the bottom of body
       if (isHtml) {
-        finalBodyHtml = `${spunBody}<br><br><p style="color:#777777;font-size:12px;margin-top:15px;">${uniqueIdTag}</p>`;
-        finalBodyText = `${createPlainTextFromHtml(spunBody)}\n\n${uniqueIdTag}`;
+        finalBodyHtml = spunBody + unsubscribeFooterHtml;
+        finalBodyText = createPlainTextFromHtml(spunBody) + unsubscribeFooterText;
       } else {
-        finalBodyText = `${spunBody}\n\n${uniqueIdTag}`;
+        finalBodyText = spunBody + unsubscribeFooterText;
       }
 
-      // 3. Clean RFC Compliant Headers (Passes DKIM and SPF checks)
+      // RFC Standard Headers (Inboxing Rate Elevators)
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
         to: recipient,
         replyTo: cleanEmail,
         subject: spunSubject,
         text: finalBodyText,
-        ...(isHtml && { html: finalBodyHtml })
+        ...(isHtml && { html: finalBodyHtml }),
+        headers: {
+          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+          'X-Entity-Ref-ID': refId
+        }
       };
 
       await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient, messageIdTag: uniqueIdTag })}\n\n`);
+      res.write(`data: ${JSON.stringify({ success: true, recipient, refId })}\n\n`);
 
     } catch (err) {
       console.error(`Send Error (${recipient}):`, err.message);
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
     }
 
-    // Dynamic Pace (1.0s to 2.0s Delay) - Best balance for high speed + inbox deliverability
+    // HUMAN PACING DELAY (1.0s to 1.8s per email)
     if (i < recipients.length - 1) {
-      const safeDelay = Math.floor(1000 + Math.random() * 750);
-      await new Promise(resolve => setTimeout(resolve, safeDelay));
+      const safeDelay = Math.floor(600 + Math.random() * 600);
+      
+      // Step-by-step sleep to prevent SSE timeout
+      const seconds = Math.floor(safeDelay / 1000);
+      for (let s = 0; s < seconds; s++) {
+        if (globalSession.stopRequested) break;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        res.write(': keep-alive\n\n');
+      }
     }
   }
 
@@ -216,5 +230,5 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on Port ${PORT}`);
+  console.log(`Inboxing Server listening on Port ${PORT}`);
 });

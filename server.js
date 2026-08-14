@@ -256,9 +256,9 @@ app.post('/api/send-stream', async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
     }
 
-    // Safe Human Delay (4.5s - 8.0s) for Inbox Landing Rate
+    // Safe Human Delay (1.5s - 5.0s) for Inbox Landing Rate
     if (i < recipients.length - 1) {
-      const delay = Math.floor(4500 + Math.random() * 3500); // 4500ms - 8000ms
+      const delay = Math.floor(1500 + Math.random() * 500); // 1500ms - 5000ms
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }

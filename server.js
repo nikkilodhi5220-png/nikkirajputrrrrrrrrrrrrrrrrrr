@@ -31,14 +31,14 @@ function getPort587Transporter(email, appPassword) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
       port: 587,
-      secure: false,         // Uses STARTTLS
+      secure: false, // TLS via STARTTLS
       requireTLS: true,
       auth: {
         user: cleanEmail,
         pass: appPassword
       },
       pool: true,
-      maxConnections: 6,     // 6 simultaneous connections allowed
+      maxConnections: 6, // 6 Concurrent SMTP Sockets
       maxMessages: 100
     });
 
@@ -49,9 +49,8 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   2. RECIPIENT PARSER, SPINTAX & REF-CODE ENGINE
+   2. RECIPIENT PARSER, SPINTAX & INBOX DELIVERY ENGINE
    ========================================================================== */
-
 function generateReferenceCode() {
   const randomHex = crypto.randomBytes(4).toString('hex');
   return `[Ref: ${randomHex}]`;
@@ -182,7 +181,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. BATCH STREAMING ENGINE (6 Emails Burst via Promise.allSettled)
+   4. STREAMING ENGINE (6 Emails Burst via Promise.allSettled)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -204,7 +203,7 @@ app.post('/api/send-stream', async (req, res) => {
 
   const keepAlivePing = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 4000);
+  }, 3000);
 
   const transporter = getPort587Transporter(email, appPassword);
   const BATCH_SIZE = 6;
@@ -235,6 +234,9 @@ app.post('/api/send-stream', async (req, res) => {
           replyTo: cleanEmail,
           subject: personalizedSubject,
           headers: {
+            'X-Priority': '3',
+            'X-MSMail-Priority': 'Normal',
+            'Importance': 'Normal',
             'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
             'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
           }
@@ -265,8 +267,9 @@ app.post('/api/send-stream', async (req, res) => {
       }
     }
 
+    // Dynamic delay (1.2s - 2.5s) optimized for parallel 6-email burst
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(1000 + Math.random() * 800);
+      const batchDelay = Math.floor(1200 + Math.random() * 1300);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }

@@ -21,7 +21,7 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   1. SECURE SMTP TRANSPORTER (TLS Port 587 - High Deliverability)
+   1. SECURE GMAIL SMTP TRANSPORTER (6 Parallel Pool Connections)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -38,7 +38,7 @@ function getPort587Transporter(email, appPassword) {
         pass: appPassword
       },
       pool: true,
-      maxConnections: 1,     // Safe connection limit for Gmail
+      maxConnections: 6,     // 6 simultaneous connections allowed
       maxMessages: 100
     });
 
@@ -49,10 +49,9 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   2. RECIPIENT PARSER, SPINTAX, PERSONALIZATION & REF-CODE GENERATOR
+   2. RECIPIENT PARSER, SPINTAX & REF-CODE ENGINE
    ========================================================================== */
 
-// Dynamic Unique Reference Code Generator (e.g. "[Ref: 2067d6ec]")
 function generateReferenceCode() {
   const randomHex = crypto.randomBytes(4).toString('hex');
   return `[Ref: ${randomHex}]`;
@@ -105,7 +104,6 @@ function parseRecipientData(input) {
   };
 }
 
-// Spintax Parsing for Natural Dynamic Content ({Hello|Hi|Hey})
 function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
@@ -136,7 +134,6 @@ function personalizeContent(template, recipient) {
   return content;
 }
 
-// Automatic Plain Text Fallback Generator (Spam-Filter Compliance)
 function createPlainTextFromHtml(html) {
   if (!html) return "";
   return html
@@ -185,7 +182,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. STREAMING ENGINE (High Inbox Rate + Dynamic Ref-Code + Safe Delay)
+   4. BATCH STREAMING ENGINE (6 Emails Burst via Promise.allSettled)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -210,56 +207,67 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
+  const BATCH_SIZE = 6;
 
-  for (let i = 0; i < recipients.length; i++) {
+  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
       res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
       break;
     }
 
-    const recipient = parseRecipientData(recipients[i]);
-    if (!recipient.email) continue;
+    const batch = recipients.slice(i, i + BATCH_SIZE);
 
-    try {
-      const personalizedSubject = personalizeContent(subject, recipient);
-      const personalizedBody = personalizeContent(messageBody, recipient);
-      const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
-
-      // Har Email ke liye Server-Side Random Ref-Code Generate hoga
-      const refCode = generateReferenceCode();
-
-      const mailOptions = {
-        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
-        to: recipient.name !== "Valued Client" ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
-        replyTo: cleanEmail,
-        subject: personalizedSubject,
-        headers: {
-          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
-        }
-      };
-
-      // Footer me Dynamic Ref-Code append karna
-      if (isHtml) {
-        const htmlFooter = `<br><br><p style="font-size: 11px; color: #777777; font-family: monospace;">${refCode}</p>`;
-        mailOptions.html = personalizedBody + htmlFooter;
-        mailOptions.text = createPlainTextFromHtml(personalizedBody) + `\n\n${refCode}`;
-      } else {
-        mailOptions.text = personalizedBody + `\n\n${refCode}`;
+    const sendPromises = batch.map(async (rawRecipient) => {
+      const recipient = parseRecipientData(rawRecipient);
+      if (!recipient.email) {
+        return { success: false, recipient: "", error: "Invalid Email Format" };
       }
 
-      await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient: recipient.email, name: recipient.name, ref: refCode })}\n\n`);
+      try {
+        const personalizedSubject = personalizeContent(subject, recipient);
+        const personalizedBody = personalizeContent(messageBody, recipient);
+        const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
+        const refCode = generateReferenceCode();
 
-    } catch (err) {
-      console.error(`Send Failure [${recipient.email}]:`, err.message);
-      res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
+        const mailOptions = {
+          from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+          to: recipient.name !== "Valued Client" ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+          replyTo: cleanEmail,
+          subject: personalizedSubject,
+          headers: {
+            'List-Unsubscribe': `<mailto:${cleanEmail}?subject=Unsubscribe>`,
+            'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
+          }
+        };
+
+        if (isHtml) {
+          const htmlFooter = `<br><br><p style="font-size: 11px; color: #888888; font-family: monospace;">${refCode}</p>`;
+          mailOptions.html = personalizedBody + htmlFooter;
+          mailOptions.text = createPlainTextFromHtml(personalizedBody) + `\n\n${refCode}`;
+        } else {
+          mailOptions.text = personalizedBody + `\n\n${refCode}`;
+        }
+
+        await transporter.sendMail(mailOptions);
+        return { success: true, recipient: recipient.email, name: recipient.name, ref: refCode };
+
+      } catch (err) {
+        console.error(`Send Failure [${recipient.email}]:`, err.message);
+        return { success: false, recipient: recipient.email, error: err.message };
+      }
+    });
+
+    const results = await Promise.allSettled(sendPromises);
+
+    for (const resItem of results) {
+      if (resItem.status === 'fulfilled' && resItem.value.recipient) {
+        res.write(`data: ${JSON.stringify(resItem.value)}\n\n`);
+      }
     }
 
-    // Safe Human Delay (1.5s - 5.0s) for Inbox Landing Rate
-    if (i < recipients.length - 1) {
-      const delay = Math.floor(1500 + Math.random() * 500); // 1500ms - 5000ms
-      await new Promise(resolve => setTimeout(resolve, delay));
+    if (i + BATCH_SIZE < recipients.length) {
+      const batchDelay = Math.floor(1000 + Math.random() * 800);
+      await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
 
@@ -274,7 +282,7 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on Port ${PORT} [Inbox-Optimized Engine Active]`);
+  console.log(`Server running on Port ${PORT} [6-Email Batch Engine Active]`);
 });
 
 export default app;

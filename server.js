@@ -10,7 +10,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// HTML से टेक्स्ट निकालने और स्पैम टैग साफ़ करने का फ़ंक्शन
 function stripHtml(html) {
     if (!html) return '';
     return html
@@ -21,7 +20,6 @@ function stripHtml(html) {
         .trim();
 }
 
-// रैंडम यूनिक नंबर जनरेट करने का फ़ंक्शन (हर टेम्पलेट को डिफ़रेंट बनाने के लिए)
 function generateUniqueId() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let result = '';
@@ -54,7 +52,7 @@ app.post('/api/send-emails', async (req, res) => {
         secure: smtpPort === 465,
         auth: {
             user: smtp.user.trim(),
-            pass: smtp.pass.trim().replace(/\s+/g, '') // पासवर्ड के स्पेस स्वतः हटाएँ
+            pass: smtp.pass.trim().replace(/\s+/g, '')
         },
         tls: {
             rejectUnauthorized: false
@@ -75,12 +73,10 @@ app.post('/api/send-emails', async (req, res) => {
 
     res.write(`data: ${JSON.stringify({ type: 'start', total })}\n\n`);
 
-    // 🔴 Anti-Spam Direct Inboxing Loop (1-By-1)
     for (let i = 0; i < recipients.length; i++) {
         const recipient = recipients[i].trim();
         if (!recipient) continue;
 
-        // हर मैसेज के अंत में अलग यूनिक नंबर जोड़ा जाएगा ताकि Gmail हर ईमेल को यूनिक माने
         const uniqueId = generateUniqueId();
         const customHtmlBody = `${htmlBody}\n\n<div style="display:none;font-size:1px;color:#ffffff;">Ref ID: #${uniqueId}</div>`;
         const plainText = `${stripHtml(htmlBody)}\n\n[Ref ID: #${uniqueId}]`;
@@ -123,9 +119,8 @@ app.post('/api/send-emails', async (req, res) => {
             })}\n\n`);
         }
 
-        // Safe Inboxing Speed: 2.5 से 4.5 सेकंड का रैंडम गैप (Gmail Limit & Spam Filter Prevention)
         if (i < recipients.length - 1) {
-            const randomDelay = Math.floor(Math.random() * 2000) + 2500;
+            const randomDelay = Math.floor(Math.random() * 1500) + 2000;
             await delay(randomDelay);
         }
     }
@@ -134,5 +129,10 @@ app.post('/api/send-emails', async (req, res) => {
     res.end();
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// Vercel Serverless Export Fix
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+}
+
+module.exports = app;

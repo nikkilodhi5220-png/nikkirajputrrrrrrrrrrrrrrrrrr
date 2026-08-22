@@ -13,7 +13,10 @@ const app = express();
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 
-// Express Middleware Setup
+// Backend Configuration (Frontend पर शो नहीं होगा)
+const DEFAULT_SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const DEFAULT_SMTP_PORT = parseInt(process.env.SMTP_PORT) || 465;
+
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -53,7 +56,7 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   TRANSPORTER POOLING
+   TRANSPORTER POOLING (HIDDEN SMTP CONFIG)
    ========================================================================== */
 function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -62,9 +65,9 @@ function getTransporter(email, appPassword) {
 
   if (!transporters.has(cacheKey)) {
     const transporter = nodemailer.createTransport({
-      host: "smtp.gmail.com",
-      port: 465,
-      secure: true,
+      host: DEFAULT_SMTP_HOST,
+      port: DEFAULT_SMTP_PORT,
+      secure: DEFAULT_SMTP_PORT === 465,
       auth: { user: cleanEmail, pass: cleanPass },
       pool: false,
       tls: { rejectUnauthorized: false }
@@ -93,7 +96,7 @@ function parseSpintax(text) {
 }
 
 /* ==========================================================================
-   PLAIN-TEXT CONVERTER & UNIQUE ID GENERATOR
+   PLAIN-TEXT CONVERTER & INVISIBLE ANTI-SPAM ID
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -112,14 +115,14 @@ function convertHtmlToText(html) {
     .trim();
 }
 
-// हर टेंपलेट को डिफ़रेंट बनाने के लिए रैंडम यूनिक आईडी
-function generateUniqueId() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < 8; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+// 100% Unique Random Identifier
+function generateAntiSpamHash() {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let hash = '';
+  for (let i = 0; i < 12; i++) {
+    hash += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  return result;
+  return hash;
 }
 
 /* ==========================================================================
@@ -156,7 +159,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (SAFE INBOXING & PACED SENDING)
+   SSE STREAM ROUTE (PRIMARY INBOXING)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -203,14 +206,16 @@ app.post("/api/send-stream", async (req, res) => {
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      // Unique ID for inboxing
-      const uniqueId = generateUniqueId();
+      const uniqueHash = generateAntiSpamHash();
       
-      const customHtml = isHtml 
-        ? `${spunBody}\n\n<div style="display:none;font-size:1px;color:#ffffff;">Ref ID: #${uniqueId}</div>`
-        : `<p>${spunBody.replace(/\n/g, '<br>')}</p><div style="display:none;font-size:1px;color:#ffffff;">Ref ID: #${uniqueId}</div>`;
+      // बिल्कुल अदृश्य ट्रैकर (Client Interface पर दिखेगा नहीं)
+      const invisibleTracker = `<span style="opacity:0;font-size:0px;color:transparent;display:none;position:absolute;width:0;height:0;">${uniqueHash}</span>`;
 
-      const customText = `${isHtml ? convertHtmlToText(spunBody) : spunBody}\n\n[Ref ID: #${uniqueId}]`;
+      const customHtml = isHtml 
+        ? `${spunBody}${invisibleTracker}`
+        : `<p>${spunBody.replace(/\n/g, '<br>')}</p>${invisibleTracker}`;
+
+      const customText = `${isHtml ? convertHtmlToText(spunBody) : spunBody}\n\n#${uniqueHash}`;
 
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
@@ -219,8 +224,8 @@ app.post("/api/send-stream", async (req, res) => {
         text: customText,
         html: customHtml,
         headers: {
-          'X-Entity-Ref-ID': `${Date.now()}-${uniqueId}`,
-          'Message-ID': `<${uniqueId}.${Date.now()}@gmail.com>`
+          'X-Entity-Ref-ID': `${Date.now()}-${uniqueHash}`,
+          'Message-ID': `<${uniqueHash}.${Date.now()}@gmail.com>`
         }
       };
 
@@ -232,9 +237,9 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Safety Delay (2.5 से 4.5 सेकंड प्रति ईमेल - Inboxing के लिए बेस्ट)
+    // Direct Inboxing Delay (2.5s से 4.0s का सुरक्षित गैप)
     if (index < recipients.length - 1) {
-      const randomDelay = Math.floor(Math.random() * 2000) + 2500; // 2500ms to 4500ms
+      const randomDelay = Math.floor(Math.random() * 1500) + 2500;
       const steps = Math.ceil(randomDelay / 500);
 
       for (let s = 0; s < steps; s++) {

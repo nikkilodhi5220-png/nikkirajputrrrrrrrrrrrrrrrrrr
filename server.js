@@ -22,7 +22,7 @@ const activeSessions = {};
 const transporters = new Map();
 
 /* ==========================================================================
-   TRANSPORTER POOLING (TLS Socket & Port 587 Direct Handling)
+   TRANSPORTER POOLING (Authentic Gmail SMTP Config)
    ========================================================================== */
 function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -31,20 +31,14 @@ function getTransporter(email, appPassword) {
 
   if (!transporters.has(cacheKey)) {
     const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false, // TLS Require
-      requireTLS: true,
+      service: 'gmail',
       auth: {
         user: cleanEmail,
         pass: cleanPass
       },
       pool: true,
       maxConnections: 1,
-      maxMessages: 50,
-      tls: {
-        rejectUnauthorized: false
-      }
+      maxMessages: 50
     });
     transporters.set(cacheKey, transporter);
   }
@@ -73,9 +67,9 @@ function parseSpintax(text) {
 }
 
 function generateRandomHash() {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let hash = '';
-  for (let i = 0; i < 14; i++) {
+  for (let i = 0; i < 8; i++) {
     hash += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return hash;
@@ -142,7 +136,6 @@ app.post("/api/send-stream", async (req, res) => {
 
   const senderEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/["\r\n]/g, "").trim();
-  const senderDomain = senderEmail.split('@')[1] || 'gmail.com';
 
   activeSessions['global_stop'] = false;
 
@@ -163,19 +156,18 @@ app.post("/api/send-stream", async (req, res) => {
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      // Inboxing Enhancements: Anti-Spam Hidden Footprint
+      // Safe Dynamic Identifier for Inboxing
       const antiSpamHash = generateRandomHash();
-      const invisibleFootprint = `<span style="opacity:0;font-size:0px;color:transparent;display:none;position:absolute;width:0;height:0;">${antiSpamHash}</span>`;
 
       let finalHtml = "";
       let finalPlainText = "";
 
       if (isHtml) {
-        finalHtml = `${spunBody}${invisibleFootprint}`;
-        finalPlainText = `${convertHtmlToText(spunBody)}\n\nRef: ${antiSpamHash}`;
+        finalHtml = `${spunBody}<p style="margin-top:20px;font-size:11px;color:#888888;">Ref: #${antiSpamHash}</p>`;
+        finalPlainText = `${convertHtmlToText(spunBody)}\n\nRef: #${antiSpamHash}`;
       } else {
-        finalHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; color: #000000; line-height: 1.5;">${spunBody.replace(/\n/g, '<br>')}</div>${invisibleFootprint}`;
-        finalPlainText = `${spunBody}\n\nRef: ${antiSpamHash}`;
+        finalHtml = `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #222222; line-height: 1.6;">${spunBody.replace(/\n/g, '<br>')}</div><p style="margin-top:20px;font-size:11px;color:#888888;">Ref: #${antiSpamHash}</p>`;
+        finalPlainText = `${spunBody}\n\nRef: #${antiSpamHash}`;
       }
 
       const mailOptions = {
@@ -185,12 +177,8 @@ app.post("/api/send-stream", async (req, res) => {
         subject: spunSubject,
         html: finalHtml,
         text: finalPlainText,
-        encoding: 'utf-8',
         headers: {
-          'X-Entity-Ref-ID': `${Date.now()}-${antiSpamHash}`,
-          'Message-ID': `<${antiSpamHash}.${Date.now()}@${senderDomain}>`,
-          'List-Unsubscribe': `<mailto:${senderEmail}?subject=unsubscribe>`,
-          'X-Mailer': 'Nodemailer Express Engine'
+          'List-Unsubscribe': `<mailto:${senderEmail}?subject=unsubscribe>`
         }
       };
 
@@ -202,9 +190,9 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Dynamic Human Delay (1.5s to 2.5s) to Bypass Gmail Spam Trigger
+    // Humanized Delay (.5s to 1.0s) - Essential for Gmail Inbox Placement
     if (index < recipients.length - 1) {
-      const randomDelay = Math.floor(Math.random() * 1000) + 1250;
+      const randomDelay = Math.floor(Math.random() * 200) + 300;
       const steps = Math.ceil(randomDelay / 500);
 
       for (let s = 0; s < steps; s++) {

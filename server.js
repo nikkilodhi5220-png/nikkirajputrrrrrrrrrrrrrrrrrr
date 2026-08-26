@@ -299,9 +299,9 @@ app.post('/api/send-stream', async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
     }
 
-    // Human-like delay between single emails (2.5s to 4.5s) to guarantee high deliverability
+    // Human-like delay between single emails (1.0s to 1.8s) to guarantee high deliverability
     if (i < recipients.length - 1) {
-      const randomDelay = Math.floor(2500 + Math.random() * 2000);
+      const randomDelay = Math.floor(1000 + Math.random() * 800);
       await new Promise(resolve => setTimeout(resolve, randomDelay));
     }
   }

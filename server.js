@@ -49,7 +49,7 @@ async function verifyTurnstileToken(token, remoteIp) {
 }
 
 /* ==========================================================================
-   GMAIL TLS TRANSPORTER POOL (Port 587 STARTTLS)
+   OPTIMIZED INBOX TRANSPORTER POOL
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -58,50 +58,18 @@ function getPort587Transporter(email, appPassword) {
 
   if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false, // Standard RFC STARTTLS
-      requireTLS: true,
+      service: 'gmail',
       auth: {
         user: cleanEmail,
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 3, // Synchronized 3-Batch Processing
-      maxMessages: 1000,
-      socketTimeout: 35000,
-      connectionTimeout: 35000
+      maxConnections: 2, // 2 connections for optimized throughput
+      maxMessages: 100
     });
     poolMap.set(key, transporter);
   }
   return poolMap.get(key);
-}
-
-/* ==========================================================================
-   ZERO-WIDTH SHIELD (Masks High-Risk Keywords From Bayesian Filters)
-   ========================================================================== */
-const SENSITIVE_WORDS = [
-  'screenshot', 'screenshots', 'report', 'reports', 'seo', 'details',
-  'quote', 'quotes', 'information', 'audit', 'ranking', '1st page',
-  'first page', 'traffic', 'proposal', 'price', 'pricing', 'guarantee',
-  'free', 'deal', 'offer', 'urgent', 'leads', 'cheap', 'cost'
-];
-
-function applyKeywordFilterShield(text) {
-  if (!text) return '';
-  let shielded = String(text);
-
-  SENSITIVE_WORDS.forEach(word => {
-    const regex = new RegExp(`\\b(${word})\\b`, 'gi');
-    shielded = shielded.replace(regex, (match) => {
-      if (match.length >= 2) {
-        return match.slice(0, 1) + '&zwnj;' + match.slice(1);
-      }
-      return match;
-    });
-  });
-
-  return shielded;
 }
 
 /* ==========================================================================
@@ -197,7 +165,6 @@ function createCleanPlainText(text) {
     .replace(/<\/p>/gi, '\n\n')
     .replace(/<\/div>/gi, '\n')
     .replace(/<[^>]+>/g, '')
-    .replace(/&zwnj;/g, '')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
@@ -247,7 +214,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   PRIMARY INBOX STREAMING DISPATCH ROUTE (3-BATCH ENGINE)
+   STREAMING DISPATCH (0.5s - 1.5s Rate Limited)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -282,87 +249,59 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 3; // 3 Parallel Emails
 
-  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+  for (let i = 0; i < recipients.length; i++) {
     if (globalSession.stopRequested) {
       res.write(`data: ${JSON.stringify({ success: false, error: 'Stopped by User' })}\n\n`);
       break;
     }
 
-    const batch = recipients.slice(i, i + BATCH_SIZE);
-
-    const sendPromises = batch.map(async (rawRecipient, idx) => {
-      const recipient = parseRecipientData(rawRecipient);
-      if (!recipient.email) return { success: false, recipient: '', error: 'Invalid Email' };
-
-      try {
-        if (idx > 0) {
-          // Micro-stagger inside 3-batch (200ms - 350ms) to defeat rate limits
-          await new Promise(resolve => setTimeout(resolve, Math.floor(200 + Math.random() * 150)));
-        }
-
-        const personalizedSubject = personalizeContent(subject, recipient);
-        const personalizedBody = personalizeContent(messageBody, recipient);
-        const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
-
-        let cleanBodyText = isHtml
-          ? personalizedBody
-          : personalizedBody.replace(/\n/g, '<br>');
-
-        // Apply invisible keyword protection
-        cleanBodyText = applyKeywordFilterShield(cleanBodyText);
-
-        // Outlook: 16.5px (12.5pt) | Gmail: 15px | 1-line top margin gap
-        const formattedHtml = `
-        <!--[if mso]>
-        <style type="text/css">
-          body, table, td, p, div, span { font-size: 16.5px !important; font-family: Calibri, 'Segoe UI', Arial, sans-serif !important; line-height: 1.7 !important; }
-        </style>
-        <div style="margin-top: 18px; line-height: 1.7;">
-        <![endif]-->
-        <div dir="ltr" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; margin-top: 16px; padding-top: 2px;">
-          ${cleanBodyText}
-        </div>
-        <!--[if mso]>
-        </div>
-        <![endif]-->`;
-
-        const plainTextFormatted = `\n\n${createCleanPlainText(personalizedBody)}`;
-
-        // Authentic RFC 5322 Standard Payload (Quoted-Printable for Zero Spam Flags)
-        const mailOptions = {
-          from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
-          to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
-          replyTo: cleanEmail,
-          date: new Date(),
-          subject: personalizedSubject || 'No Subject',
-          html: formattedHtml,
-          text: plainTextFormatted,
-          textEncoding: 'quoted-printable',
-          encoding: 'utf-8'
-        };
-
-        await transporter.sendMail(mailOptions);
-        return { success: true, recipient: recipient.email, name: recipient.name };
-
-      } catch (err) {
-        return { success: false, recipient: recipient.email, error: err.message };
-      }
-    });
-
-    const results = await Promise.allSettled(sendPromises);
-
-    for (const resItem of results) {
-      if (resItem.status === 'fulfilled' && resItem.value.recipient) {
-        res.write(`data: ${JSON.stringify(resItem.value)}\n\n`);
-      }
+    const recipient = parseRecipientData(recipients[i]);
+    if (!recipient.email) {
+      res.write(`data: ${JSON.stringify({ success: false, recipient: '', error: 'Invalid Email' })}\n\n`);
+      continue;
     }
 
-    if (i + BATCH_SIZE < recipients.length) {
-      // Natural pacing interval (1.8s - 2.8s) between 3-batches
-      const safeBatchDelay = Math.floor(1800 + Math.random() * 1000);
-      await new Promise(resolve => setTimeout(resolve, safeBatchDelay));
+    try {
+      const personalizedSubject = personalizeContent(subject, recipient);
+      const personalizedBody = personalizeContent(messageBody, recipient);
+      const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
+
+      let cleanBodyText = isHtml
+        ? personalizedBody
+        : personalizedBody.replace(/\n/g, '<br>');
+
+      const formattedHtml = `
+        <div dir="ltr" style="font-family: Arial, sans-serif; font-size: 14px; color: #222222; line-height: 1.6;">
+          ${cleanBodyText}
+        </div>`;
+
+      const plainTextFormatted = createCleanPlainText(personalizedBody);
+
+      const mailOptions = {
+        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+        to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+        replyTo: cleanEmail,
+        date: new Date(),
+        subject: personalizedSubject || 'No Subject',
+        html: formattedHtml,
+        text: plainTextFormatted,
+        headers: {
+          'List-Unsubscribe': `<mailto:${cleanEmail}?subject=unsubscribe>`
+        }
+      };
+
+      await transporter.sendMail(mailOptions);
+      res.write(`data: ${JSON.stringify({ success: true, recipient: recipient.email, name: recipient.name })}\n\n`);
+
+    } catch (err) {
+      res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
+    }
+
+    // Delay tuned to 500ms - 1500ms (0.5 to 1.5 per second target speed)
+    if (i < recipients.length - 1) {
+      const targetDelay = Math.floor(500 + Math.random() * 1000);
+      await new Promise(resolve => setTimeout(resolve, targetDelay));
     }
   }
 
@@ -376,8 +315,10 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: 'Sending process stopped' });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Mailer server running on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`🚀 Mailer server running on port ${PORT}`);
+  });
+}
 
 export default app;

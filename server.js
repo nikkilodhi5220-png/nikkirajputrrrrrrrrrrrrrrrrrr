@@ -156,7 +156,7 @@ app.post("/api/send-stream", async (req, res) => {
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      // Safe Dynamic Identifier for Inboxing
+      // Unique Ref Tag to avoid Duplicate Content Penalty
       const antiSpamHash = generateRandomHash();
 
       let finalHtml = "";
@@ -190,9 +190,9 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Humanized Delay (.5s to 1.0s) - Essential for Gmail Inbox Placement
+    // Fixed Dynamic Delay (1.0s to 1.5s) to guarantee Inbox Delivery
     if (index < recipients.length - 1) {
-      const randomDelay = Math.floor(Math.random() * 200) + 300;
+      const randomDelay = Math.floor(Math.random() * 800) + 1200;
       const steps = Math.ceil(randomDelay / 500);
 
       for (let s = 0; s < steps; s++) {

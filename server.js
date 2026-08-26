@@ -9,31 +9,42 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-
+const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || '##';
 
 // Express Middleware Setup
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const activeSessions = {};
 const transporters = new Map();
 
 /* ==========================================================================
-   TRANSPORTER POOLING (TLS Socket Reuse)
+   TRANSPORTER POOLING (TLS Socket & Port 587 Direct Handling)
    ========================================================================== */
 function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
-  const cacheKey = `${cleanEmail}_${appPassword}`;
+  const cleanPass = appPassword.trim().replace(/\s+/g, '');
+  const cacheKey = `${cleanEmail}_${cleanPass}`;
 
   if (!transporters.has(cacheKey)) {
     const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user: cleanEmail, pass: appPassword },
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false, // TLS Require
+      requireTLS: true,
+      auth: {
+        user: cleanEmail,
+        pass: cleanPass
+      },
       pool: true,
-      maxConnections: 3,
-      maxMessages: 100
+      maxConnections: 1,
+      maxMessages: 50,
+      tls: {
+        rejectUnauthorized: false
+      }
     });
     transporters.set(cacheKey, transporter);
   }
@@ -41,21 +52,33 @@ function getTransporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   SPINTAX PARSER ({Hi|Hello|Hey})
+   SPINTAX PARSER & ANTI-SPAM HASH
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
-  let spun = text;
-  const regex = /{([^{}]+)}/g;
+  let spun = String(text);
+  const regex = /\{([^{}]+)\}/s;
   let iterations = 0;
-  while (regex.test(spun) && iterations < 10) {
+
+  while (regex.test(spun) && iterations < 30) {
     spun = spun.replace(regex, (_, choices) => {
+      if (!choices.includes('|')) return choices;
       const options = choices.split('|');
-      return options[Math.floor(Math.random() * options.length)];
+      const pick = options[Math.floor(Math.random() * options.length)];
+      return pick ? pick.trim() : "";
     });
     iterations++;
   }
-  return spun;
+  return spun.replace(/[\{\}]/g, '').trim();
+}
+
+function generateRandomHash() {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let hash = '';
+  for (let i = 0; i < 14; i++) {
+    hash += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return hash;
 }
 
 /* ==========================================================================
@@ -69,7 +92,7 @@ function convertHtmlToText(html) {
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n\n')
     .replace(/<\/div>/gi, '\n')
-    .replace(/<[^>]*>/g, '')
+    .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
@@ -101,13 +124,13 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (STABLE & SECURE LOOP)
+   SSE STREAM ROUTE (INBOX OPTIMIZED ENGINE)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Prevents proxy buffering on Vercel/Nginx
+  res.setHeader('X-Accel-Buffering', 'no');
 
   const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
 
@@ -118,7 +141,8 @@ app.post("/api/send-stream", async (req, res) => {
   }
 
   const senderEmail = email.toLowerCase().trim();
-  const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
+  const cleanSenderName = (senderName || "").replace(/["\r\n]/g, "").trim();
+  const senderDomain = senderEmail.split('@')[1] || 'gmail.com';
 
   activeSessions['global_stop'] = false;
 
@@ -131,7 +155,6 @@ app.post("/api/send-stream", async (req, res) => {
     const recipient = recipients[index] ? recipients[index].trim() : "";
     if (!recipient) continue;
 
-    // Connection keep-alive ping
     res.write(': keep-alive\n\n');
 
     try {
@@ -140,18 +163,36 @@ app.post("/api/send-stream", async (req, res) => {
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
+      // Inboxing Enhancements: Anti-Spam Hidden Footprint
+      const antiSpamHash = generateRandomHash();
+      const invisibleFootprint = `<span style="opacity:0;font-size:0px;color:transparent;display:none;position:absolute;width:0;height:0;">${antiSpamHash}</span>`;
+
+      let finalHtml = "";
+      let finalPlainText = "";
+
+      if (isHtml) {
+        finalHtml = `${spunBody}${invisibleFootprint}`;
+        finalPlainText = `${convertHtmlToText(spunBody)}\n\nRef: ${antiSpamHash}`;
+      } else {
+        finalHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; color: #000000; line-height: 1.5;">${spunBody.replace(/\n/g, '<br>')}</div>${invisibleFootprint}`;
+        finalPlainText = `${spunBody}\n\nRef: ${antiSpamHash}`;
+      }
+
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
-        subject: spunSubject
+        replyTo: senderEmail,
+        subject: spunSubject,
+        html: finalHtml,
+        text: finalPlainText,
+        encoding: 'utf-8',
+        headers: {
+          'X-Entity-Ref-ID': `${Date.now()}-${antiSpamHash}`,
+          'Message-ID': `<${antiSpamHash}.${Date.now()}@${senderDomain}>`,
+          'List-Unsubscribe': `<mailto:${senderEmail}?subject=unsubscribe>`,
+          'X-Mailer': 'Nodemailer Express Engine'
+        }
       };
-
-      if (isHtml) {
-        mailOptions.html = spunBody;
-        mailOptions.text = convertHtmlToText(spunBody);
-      } else {
-        mailOptions.text = spunBody;
-      }
 
       await transporter.sendMail(mailOptions);
       res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
@@ -161,9 +202,15 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // Safe 1.5-Second Delay to avoid socket crashing
+    // Dynamic Human Delay (1.5s to 2.5s) to Bypass Gmail Spam Trigger
     if (index < recipients.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, 400));
+      const randomDelay = Math.floor(Math.random() * 1000) + 1250;
+      const steps = Math.ceil(randomDelay / 500);
+
+      for (let s = 0; s < steps; s++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        res.write(': keep-alive\n\n');
+      }
     }
   }
 
@@ -180,6 +227,12 @@ app.post("/api/stop", (req, res) => {
 });
 
 /* ==========================================================================
-   VERCEL / SERVERLESS HANDLER EXPORT
+   SERVER INITIALIZATION
    ========================================================================== */
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server running on Port ${PORT}`);
+  });
+}
+
 export default app;

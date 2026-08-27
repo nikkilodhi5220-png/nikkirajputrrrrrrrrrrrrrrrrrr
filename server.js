@@ -3,6 +3,7 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -49,7 +50,7 @@ async function verifyTurnstileToken(token, remoteIp) {
 }
 
 /* ==========================================================================
-   GMAIL TLS TRANSPORTER POOL (Port 587 STARTTLS)
+   OPTIMIZED SMTP TRANSPORTER POOL (Port 587 STARTTLS)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -60,17 +61,17 @@ function getPort587Transporter(email, appPassword) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
       port: 587,
-      secure: false, // RFC Compliant STARTTLS
+      secure: false, // Standard RFC STARTTLS
       requireTLS: true,
       auth: {
         user: cleanEmail,
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // 6 Parallel Connections for Batching
-      maxMessages: 50000,
-      socketTimeout: 30000,
-      connectionTimeout: 30000
+      maxConnections: 4, // Optimal socket threshold to prevent rate limits
+      maxMessages: 500,
+      socketTimeout: 15000,
+      connectionTimeout: 15000
     });
     poolMap.set(key, transporter);
   }
@@ -78,8 +79,12 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   RECIPIENT NORMALIZATION & ADVANCED SPINTAX ENGINE
+   DYNAMIC REF ENGINE & DATA PARSERS
    ========================================================================== */
+function generateReferenceCode() {
+  return `[Ref: ${crypto.randomBytes(3).toString('hex')}]`;
+}
+
 function parseRecipientData(input) {
   let email = '';
   let rawName = '';
@@ -219,7 +224,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   PRIMARY INBOX STREAMING ROUTE (6-Batch Engine | 1.2s - 2.0s Delay)
+   INBOX-DELIVERY ENGINE (Batching + Dynamic Fingerprinting)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -255,8 +260,8 @@ app.post('/api/send-stream', async (req, res) => {
 
   const transporter = getPort587Transporter(email, appPassword);
   
-  // Strict 6 Emails Per Batch
-  const BATCH_SIZE = 6;
+  // Parallel sending in optimized batches of 4
+  const BATCH_SIZE = 4;
 
   const defaultBestSubject = '{quick note regarding your site|website feedback|quick question for you|question about your page}';
   const defaultBestBody = "{Hi {Name},|Hello {Name},|Hey {Name},}\n\n{I noticed your site has a great presentation but isn't showing on the top results.|Your website looks clean, but seems missing from the primary search listings.}\n\n{May I send you a quick report with details?|Would you mind if I shared the screenshot with you?|Can I share the audit reports with you?}";
@@ -272,26 +277,22 @@ app.post('/api/send-stream', async (req, res) => {
 
     const batch = recipients.slice(i, i + BATCH_SIZE);
 
-    const sendPromises = batch.map(async (rawRecipient, idx) => {
+    const sendPromises = batch.map(async (rawRecipient) => {
       const recipient = parseRecipientData(rawRecipient);
       if (!recipient.email) return { success: false, recipient: '', error: 'Invalid Email' };
 
       try {
-        if (idx > 0) {
-          // Micro-stagger inside batch to bypass sudden burst detection
-          await new Promise(resolve => setTimeout(resolve, Math.floor(50 + Math.random() * 100)));
-        }
-
         const personalizedSubject = personalizeContent(finalSubjectTemplate, recipient);
         const personalizedBody = personalizeContent(finalBodyTemplate, recipient);
+        const refCode = generateReferenceCode();
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
         const cleanBodyText = isHtml
           ? personalizedBody
           : personalizedBody.replace(/\n/g, '<br>');
 
-        const formattedHtml = `<div dir="ltr" style="font-family: Arial, sans-serif; font-size: 14px; color: #222222; line-height: 1.6;">${cleanBodyText}</div>`;
-        const plainTextFormatted = createCleanPlainText(personalizedBody);
+        const formattedHtml = `<div dir="ltr" style="font-family: Arial, sans-serif; font-size: 14px; color: #111111; line-height: 1.5;">${cleanBodyText}<br><br><span style="font-size: 11px; color: #777777; font-family: monospace;">${refCode}</span></div>`;
+        const plainTextFormatted = createCleanPlainText(personalizedBody) + `\n\n${refCode}`;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
@@ -305,15 +306,16 @@ app.post('/api/send-stream', async (req, res) => {
           subject: personalizedSubject,
           text: plainTextFormatted,
           html: formattedHtml,
-          textEncoding: 'base64',
+          textEncoding: 'quoted-printable',
           encoding: 'utf-8',
           headers: {
+            'X-Mailer': 'Gmail Core Engine',
             'List-Unsubscribe': `<mailto:${cleanEmail}?subject=unsubscribe>`
           }
         };
 
         await transporter.sendMail(mailOptions);
-        return { success: true, recipient: recipient.email, name: recipient.name };
+        return { success: true, recipient: recipient.email, name: recipient.name, ref: refCode };
 
       } catch (err) {
         return { success: false, recipient: recipient.email, error: err.message };
@@ -328,9 +330,9 @@ app.post('/api/send-stream', async (req, res) => {
       }
     }
 
-    // Delay set strictly between 1.2 seconds (1200ms) and 2.0 seconds (2000ms)
+    // High Speed Jitter (300ms - 500ms) for rate protection
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(1200 + Math.random() * 800);
+      const batchDelay = Math.floor(300 + Math.random() * 200);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
@@ -346,7 +348,7 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Mailer server running on port ${PORT}`);
+  console.log(`🚀 Inbox-Optimized Mailer Server active on port ${PORT}`);
 });
 
 export default app;

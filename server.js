@@ -24,12 +24,21 @@ const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '1x000000000000
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
-// Middlewares
+// Express Configuration & Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Safe SSE Flush helper function
+const safeFlush = (res) => {
+  if (typeof res.flush === 'function') {
+    res.flush();
+  } else if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+};
 
 io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
@@ -80,7 +89,7 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // 6 Active Sockets
+      maxConnections: 6, // Strict 6 Active Sockets
       maxMessages: 1000,
       rateDelta: 1000,
       rateLimit: 6,
@@ -93,7 +102,7 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   RECIPIENT NORMALIZATION & ADVANCED SPINTAX
+   RECIPIENT NORMALIZATION & SPINTAX
    ========================================================================== */
 function parseRecipientData(input) {
   let email = '';
@@ -231,18 +240,19 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   PRIMARY INBOX 6-PARALLEL STREAMING ROUTE (FIXED PENDING & FAST SEND)
+   PRIMARY INBOX 6-PARALLEL STREAMING ROUTE
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
-  // 1. Immediately Flush Headers to resolve client pending state
+  // 1. Flush Headers Immediately for SSE Protocol
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no'
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'identity'
   });
   
-  if (typeof res.flush === 'function') res.flush();
+  safeFlush(res);
 
   const { email, appPassword, senderName, subject, messageBody, recipients, cfToken } = req.body;
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -266,16 +276,16 @@ app.post('/api/send-stream', async (req, res) => {
   const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
   globalSession.stopRequested = false;
 
-  // Realtime Heartbeat to prevent Serverless Timeout
+  // Realtime Heartbeat Ping
   const keepAlivePing = setInterval(() => {
     try { 
       res.write(': keep-alive\n\n');
-      if (typeof res.flush === 'function') res.flush();
+      safeFlush(res);
     } catch {}
   }, 2500);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6; // Concurrent batch of 6
+  const BATCH_SIZE = 6; 
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -285,20 +295,22 @@ app.post('/api/send-stream', async (req, res) => {
 
     const batch = recipients.slice(i, i + BATCH_SIZE);
 
-    // Send 6 mails in true parallel non-blocking execution
+    // Send 6 mails in parallel execution with micro delays
     await Promise.all(
       batch.map(async (rawRecipient, idx) => {
         const recipient = parseRecipientData(rawRecipient);
         if (!recipient.email) {
           const errRes = { success: false, recipient: '', error: 'Invalid Email' };
           res.write(`data: ${JSON.stringify(errRes)}\n\n`);
+          safeFlush(res);
           return;
         }
 
         try {
-          // Micro-stagger (30ms to 60ms) to ensure smooth TCP connection handshakes
-          if (idx > 0) {
-            await new Promise(resolve => setTimeout(resolve, idx * (30 + Math.floor(Math.random() * 30))));
+          // Safe micro-stagger for parallel connection handling
+          const staggerDelay = idx * (35 + Math.floor(Math.random() * 25));
+          if (staggerDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, staggerDelay));
           }
 
           const personalizedSubject = personalizeContent(subject, recipient) || 'Quick Note';
@@ -324,21 +336,20 @@ app.post('/api/send-stream', async (req, res) => {
 
           const payload = { success: true, recipient: recipient.email, name: recipient.name };
           
-          // Stream directly to HTTP response and Socket.io without delay
           res.write(`data: ${JSON.stringify(payload)}\n\n`);
-          if (typeof res.flush === 'function') res.flush();
+          safeFlush(res);
           io.emit('mail_sent', payload);
 
         } catch (err) {
           const errPayload = { success: false, recipient: recipient.email, error: err.message };
           res.write(`data: ${JSON.stringify(errPayload)}\n\n`);
-          if (typeof res.flush === 'function') res.flush();
+          safeFlush(res);
           io.emit('mail_error', errPayload);
         }
       })
     );
 
-    // Inter-batch Pacing (350ms - 500ms) to maintain maximum speed while staying safe on Port 587
+    // Dynamic Inter-Batch pacing (350ms - 500ms)
     if (i + BATCH_SIZE < recipients.length) {
       const batchDelay = Math.floor(350 + Math.random() * 150);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
@@ -347,7 +358,7 @@ app.post('/api/send-stream', async (req, res) => {
 
   clearInterval(keepAlivePing);
   res.write('data: [DONE]\n\n');
-  if (typeof res.flush === 'function') res.flush();
+  safeFlush(res);
   res.end();
 });
 
@@ -356,7 +367,7 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: 'Sending process stopped' });
 });
 
-// UI Catch-All Route with Multi-directory fallback for Vercel & Local Node
+// UI Catch-All Route with Multi-directory fallback
 app.get('*', (req, res) => {
   const filePath1 = path.join(process.cwd(), 'public', 'index.html');
   const filePath2 = path.join(__dirname, 'public', 'index.html');
@@ -369,7 +380,7 @@ app.get('*', (req, res) => {
   return res.status(200).send('<h1>Server Running</h1>');
 });
 
-// Start Server locally; Export for Vercel
+// Start Server locally; Export for Serverless Environments
 if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
   server.listen(PORT, () => {
     console.log(`🚀 Mailer server running on port ${PORT}`);

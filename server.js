@@ -78,10 +78,10 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6,
-      maxMessages: 50000,
-      socketTimeout: 30000,
-      connectionTimeout: 30000
+      maxConnections: 6, // 6 Active Sockets
+      maxMessages: 1000,
+      socketTimeout: 20000,
+      connectionTimeout: 10000
     });
     poolMap.set(key, transporter);
   }
@@ -222,14 +222,18 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   PRIMARY INBOX 6-BATCH STREAMING ROUTE
+   PRIMARY INBOX 6-PARALLEL STREAMING ROUTE (FIXED PENDING & FAST SEND)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
+  // 1. Immediately Flush Headers to resolve client pending state
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  
+  if (typeof res.flush === 'function') res.flush();
 
   const { email, appPassword, senderName, subject, messageBody, recipients, cfToken } = req.body;
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -253,12 +257,16 @@ app.post('/api/send-stream', async (req, res) => {
   const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
   globalSession.stopRequested = false;
 
+  // Realtime Heartbeat to prevent Serverless Timeout
   const keepAlivePing = setInterval(() => {
-    try { res.write(': keep-alive\n\n'); } catch {}
-  }, 4000);
+    try { 
+      res.write(': keep-alive\n\n');
+      if (typeof res.flush === 'function') res.flush();
+    } catch {}
+  }, 2500);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6;
+  const BATCH_SIZE = 6; // Concurrent batch of 6
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -268,70 +276,73 @@ app.post('/api/send-stream', async (req, res) => {
 
     const batch = recipients.slice(i, i + BATCH_SIZE);
 
-    const sendPromises = batch.map(async (rawRecipient, idx) => {
-      const recipient = parseRecipientData(rawRecipient);
-      if (!recipient.email) return { success: false, recipient: '', error: 'Invalid Email' };
-
-      try {
-        if (idx > 0) {
-          // Intra-batch stagger (150ms - 250ms)
-          await new Promise(resolve => setTimeout(resolve, Math.floor(150 + Math.random() * 100)));
+    // Send 6 mails in true parallel non-blocking execution
+    await Promise.all(
+      batch.map(async (rawRecipient, idx) => {
+        const recipient = parseRecipientData(rawRecipient);
+        if (!recipient.email) {
+          const errRes = { success: false, recipient: '', error: 'Invalid Email' };
+          res.write(`data: ${JSON.stringify(errRes)}\n\n`);
+          return;
         }
 
-        const personalizedSubject = personalizeContent(subject, recipient);
-        const personalizedBody = personalizeContent(messageBody, recipient);
-        const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
+        try {
+          // Micro-stagger (30ms to 60ms) to ensure smooth TCP connection handshakes
+          if (idx > 0) {
+            await new Promise(resolve => setTimeout(resolve, idx * (30 + Math.floor(Math.random() * 30))));
+          }
 
-        const cleanBodyText = isHtml
-          ? personalizedBody
-          : personalizedBody.replace(/\n/g, '<br>');
+          const personalizedSubject = personalizeContent(subject, recipient);
+          const personalizedBody = personalizeContent(messageBody, recipient);
+          const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
-        // 1-on-1 Clean Webmail UI formatting
-        const formattedHtml = `<div dir="ltr">${cleanBodyText}</div>`;
-        const plainTextFormatted = createCleanPlainText(personalizedBody);
+          const cleanBodyText = isHtml
+            ? personalizedBody
+            : personalizedBody.replace(/\n/g, '<br>');
 
-        const mailOptions = {
-          from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
-          to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
-          replyTo: cleanEmail,
-          date: new Date(),
-          subject: personalizedSubject || 'Hello',
-          html: formattedHtml,
-          text: plainTextFormatted,
-          textEncoding: 'quoted-printable',
-          encoding: 'utf-8'
-        };
+          const formattedHtml = `<div dir="ltr">${cleanBodyText}</div>`;
+          const plainTextFormatted = createCleanPlainText(personalizedBody);
 
-        await transporter.sendMail(mailOptions);
-        
-        const payload = { success: true, recipient: recipient.email, name: recipient.name };
-        io.emit('mail_sent', payload);
-        return payload;
+          const mailOptions = {
+            from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+            to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+            replyTo: cleanEmail,
+            date: new Date(),
+            subject: personalizedSubject || 'Hello',
+            html: formattedHtml,
+            text: plainTextFormatted,
+            textEncoding: 'quoted-printable',
+            encoding: 'utf-8'
+          };
 
-      } catch (err) {
-        const errPayload = { success: false, recipient: recipient.email, error: err.message };
-        io.emit('mail_error', errPayload);
-        return errPayload;
-      }
-    });
+          await transporter.sendMail(mailOptions);
 
-    const results = await Promise.allSettled(sendPromises);
+          const payload = { success: true, recipient: recipient.email, name: recipient.name };
+          
+          // Stream directly to HTTP response and Socket.io without delay
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          if (typeof res.flush === 'function') res.flush();
+          io.emit('mail_sent', payload);
 
-    for (const resItem of results) {
-      if (resItem.status === 'fulfilled' && resItem.value.recipient) {
-        res.write(`data: ${JSON.stringify(resItem.value)}\n\n`);
-      }
-    }
+        } catch (err) {
+          const errPayload = { success: false, recipient: recipient.email, error: err.message };
+          res.write(`data: ${JSON.stringify(errPayload)}\n\n`);
+          if (typeof res.flush === 'function') res.flush();
+          io.emit('mail_error', errPayload);
+        }
+      })
+    );
 
+    // Inter-batch Pacing (350ms - 500ms) to maintain maximum speed while staying safe on Port 587
     if (i + BATCH_SIZE < recipients.length) {
-      // Natural 800ms - 1200ms batch rest delay
-      const batchDelay = Math.floor(800 + Math.random() * 400);
+      const batchDelay = Math.floor(350 + Math.random() * 150);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
 
   clearInterval(keepAlivePing);
   res.write('data: [DONE]\n\n');
+  if (typeof res.flush === 'function') res.flush();
   res.end();
 });
 

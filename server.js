@@ -5,6 +5,7 @@ import { Server } from 'socket.io';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,11 +24,12 @@ const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '1x000000000000
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
-// Express Configuration
+// Middlewares
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(process.cwd(), 'public')));
+app.use(express.static(path.join(__dirname, 'public')));
 
 io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
@@ -80,8 +82,10 @@ function getPort587Transporter(email, appPassword) {
       pool: true,
       maxConnections: 6, // 6 Active Sockets
       maxMessages: 1000,
-      socketTimeout: 20000,
-      connectionTimeout: 10000
+      rateDelta: 1000,
+      rateLimit: 6,
+      socketTimeout: 30000,
+      connectionTimeout: 15000
     });
     poolMap.set(key, transporter);
   }
@@ -153,19 +157,24 @@ function parseSpintax(text) {
   return spun.replace(/[\{\}]/g, '').trim();
 }
 
+function sanitizeText(text) {
+  if (!text) return '';
+  return String(text).trim().replace(/^[\s!?,.-]+/g, '').trim();
+}
+
 function personalizeContent(template, recipient) {
   if (!template) return '';
   let content = parseSpintax(template);
 
-  const fallback = recipient.firstName || recipient.name || '';
+  const fallback = recipient.firstName || recipient.name || 'there';
 
-  content = content.replace(/{Name}/gi, recipient.name || fallback || 'there');
-  content = content.replace(/{FirstName}/gi, recipient.firstName || fallback || 'there');
-  content = content.replace(/{First_Name}/gi, recipient.firstName || fallback || 'there');
+  content = content.replace(/{Name}/gi, recipient.name || fallback);
+  content = content.replace(/{FirstName}/gi, recipient.firstName || fallback);
+  content = content.replace(/{First_Name}/gi, recipient.firstName || fallback);
   content = content.replace(/{Email}/gi, recipient.email);
   content = content.replace(/{Domain}/gi, recipient.domain);
 
-  return content;
+  return sanitizeText(content);
 }
 
 function createCleanPlainText(text) {
@@ -292,25 +301,21 @@ app.post('/api/send-stream', async (req, res) => {
             await new Promise(resolve => setTimeout(resolve, idx * (30 + Math.floor(Math.random() * 30))));
           }
 
-          const personalizedSubject = personalizeContent(subject, recipient);
+          const personalizedSubject = personalizeContent(subject, recipient) || 'Quick Note';
           const personalizedBody = personalizeContent(messageBody, recipient);
           const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
-          const cleanBodyText = isHtml
-            ? personalizedBody
-            : personalizedBody.replace(/\n/g, '<br>');
-
-          const formattedHtml = `<div dir="ltr">${cleanBodyText}</div>`;
-          const plainTextFormatted = createCleanPlainText(personalizedBody);
+          const cleanRawText = createCleanPlainText(personalizedBody);
+          const formattedHtml = `<div dir="ltr" style="font-family: Arial, sans-serif; font-size: 14px; color: #1a1a1a; line-height: 1.5;">${isHtml ? personalizedBody : cleanRawText.replace(/\n/g, '<br>')}</div>`;
 
           const mailOptions = {
             from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
             to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
             replyTo: cleanEmail,
             date: new Date(),
-            subject: personalizedSubject || 'Hello',
+            subject: personalizedSubject,
             html: formattedHtml,
-            text: plainTextFormatted,
+            text: cleanRawText,
             textEncoding: 'quoted-printable',
             encoding: 'utf-8'
           };
@@ -351,9 +356,17 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: 'Sending process stopped' });
 });
 
-// UI Catch-All Route
+// UI Catch-All Route with Multi-directory fallback for Vercel & Local Node
 app.get('*', (req, res) => {
-  res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
+  const filePath1 = path.join(process.cwd(), 'public', 'index.html');
+  const filePath2 = path.join(__dirname, 'public', 'index.html');
+
+  if (fs.existsSync(filePath1)) {
+    return res.sendFile(filePath1);
+  } else if (fs.existsSync(filePath2)) {
+    return res.sendFile(filePath2);
+  }
+  return res.status(200).send('<h1>Server Running</h1>');
 });
 
 // Start Server locally; Export for Vercel

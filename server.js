@@ -6,6 +6,7 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,8 +26,8 @@ const poolMap = new Map();
 
 // Express Configuration
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
 io.on('connection', (socket) => {
@@ -60,7 +61,7 @@ async function verifyTurnstileToken(token, remoteIp) {
 }
 
 /* ==========================================================================
-   GMAIL TLS TRANSPORTER POOL (Port 587 STARTTLS)
+   GMAIL TLS TRANSPORTER POOL (Standard Compliant Rate Limits)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -78,8 +79,8 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6,
-      maxMessages: 50000,
+      maxConnections: 2, // Reduced to prevent rate-limit blocks by Gmail
+      maxMessages: 100,
       socketTimeout: 30000,
       connectionTimeout: 30000
     });
@@ -89,7 +90,7 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   RECIPIENT NORMALIZATION & ADVANCED SPINTAX
+   RECIPIENT NORMALIZATION & SPINTAX
    ========================================================================== */
 function parseRecipientData(input) {
   let email = '';
@@ -156,7 +157,6 @@ function parseSpintax(text) {
 function personalizeContent(template, recipient) {
   if (!template) return '';
   let content = parseSpintax(template);
-
   const fallback = recipient.firstName || recipient.name || '';
 
   content = content.replace(/{Name}/gi, recipient.name || fallback || 'there');
@@ -222,7 +222,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   PRIMARY INBOX 6-BATCH STREAMING ROUTE
+   STREAMING DISPATCH ROUTE (Optimized for Deliverability)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -251,6 +251,7 @@ app.post('/api/send-stream', async (req, res) => {
 
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
+  const domainHost = cleanEmail.split('@')[1] || 'gmail.com';
   globalSession.stopRequested = false;
 
   const keepAlivePing = setInterval(() => {
@@ -258,75 +259,68 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6;
-
-  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+  
+  // Deliverability Change: Process emails sequentially or in small pairs with random delays
+  for (let i = 0; i < recipients.length; i++) {
     if (globalSession.stopRequested) {
       res.write(`data: ${JSON.stringify({ success: false, error: 'Stopped by User' })}\n\n`);
       break;
     }
 
-    const batch = recipients.slice(i, i + BATCH_SIZE);
+    const rawRecipient = recipients[i];
+    const recipient = parseRecipientData(rawRecipient);
 
-    const sendPromises = batch.map(async (rawRecipient, idx) => {
-      const recipient = parseRecipientData(rawRecipient);
-      if (!recipient.email) return { success: false, recipient: '', error: 'Invalid Email' };
-
-      try {
-        if (idx > 0) {
-          // Intra-batch stagger (150ms - 250ms)
-          await new Promise(resolve => setTimeout(resolve, Math.floor(150 + Math.random() * 100)));
-        }
-
-        const personalizedSubject = personalizeContent(subject, recipient);
-        const personalizedBody = personalizeContent(messageBody, recipient);
-        const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
-
-        const cleanBodyText = isHtml
-          ? personalizedBody
-          : personalizedBody.replace(/\n/g, '<br>');
-
-        // 1-on-1 Clean Webmail UI formatting
-        const formattedHtml = `<div dir="ltr">${cleanBodyText}</div>`;
-        const plainTextFormatted = createCleanPlainText(personalizedBody);
-
-        const mailOptions = {
-          from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
-          to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
-          replyTo: cleanEmail,
-          date: new Date(),
-          subject: personalizedSubject || 'Hello',
-          html: formattedHtml,
-          text: plainTextFormatted,
-          textEncoding: 'quoted-printable',
-          encoding: 'utf-8'
-        };
-
-        await transporter.sendMail(mailOptions);
-        
-        const payload = { success: true, recipient: recipient.email, name: recipient.name };
-        io.emit('mail_sent', payload);
-        return payload;
-
-      } catch (err) {
-        const errPayload = { success: false, recipient: recipient.email, error: err.message };
-        io.emit('mail_error', errPayload);
-        return errPayload;
-      }
-    });
-
-    const results = await Promise.allSettled(sendPromises);
-
-    for (const resItem of results) {
-      if (resItem.status === 'fulfilled' && resItem.value.recipient) {
-        res.write(`data: ${JSON.stringify(resItem.value)}\n\n`);
-      }
+    if (!recipient.email) {
+      res.write(`data: ${JSON.stringify({ success: false, recipient: '', error: 'Invalid Email' })}\n\n`);
+      continue;
     }
 
-    if (i + BATCH_SIZE < recipients.length) {
-      // Natural 800ms - 1200ms batch rest delay
-      const batchDelay = Math.floor(800 + Math.random() * 400);
-      await new Promise(resolve => setTimeout(resolve, batchDelay));
+    try {
+      const personalizedSubject = personalizeContent(subject, recipient);
+      const personalizedBody = personalizeContent(messageBody, recipient);
+      const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
+
+      const cleanBodyText = isHtml
+        ? personalizedBody
+        : personalizedBody.replace(/\n/g, '<br>');
+
+      const formattedHtml = `<div dir="ltr">${cleanBodyText}</div>`;
+      const plainTextFormatted = createCleanPlainText(personalizedBody);
+      
+      // Standard Unique Message-ID generation
+      const uniqueMsgId = `<${crypto.randomBytes(16).toString('hex')}@${domainHost}>`;
+
+      const mailOptions = {
+        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+        to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+        replyTo: cleanEmail,
+        date: new Date(),
+        messageId: uniqueMsgId,
+        subject: personalizedSubject || 'Hello',
+        html: formattedHtml,
+        text: plainTextFormatted,
+        headers: {
+          'X-Mailer': 'NodeMailer/Standard-Mailer',
+          'X-Report-Abuse': `mailto:${cleanEmail}`
+        }
+      };
+
+      await transporter.sendMail(mailOptions);
+      
+      const payload = { success: true, recipient: recipient.email, name: recipient.name };
+      io.emit('mail_sent', payload);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+    } catch (err) {
+      const errPayload = { success: false, recipient: recipient.email, error: err.message };
+      io.emit('mail_error', errPayload);
+      res.write(`data: ${JSON.stringify(errPayload)}\n\n`);
+    }
+
+    // Deliverability Delay: Throttle 2.5s to 4.5s per message for normal webmail accounts
+    if (i < recipients.length - 1) {
+      const delay = Math.floor(2500 + Math.random() * 2000);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
@@ -340,12 +334,10 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: 'Sending process stopped' });
 });
 
-// UI Catch-All Route
 app.get('*', (req, res) => {
   res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
 });
 
-// Start Server locally; Export for Vercel
 if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
   server.listen(PORT, () => {
     console.log(`🚀 Mailer server running on port ${PORT}`);

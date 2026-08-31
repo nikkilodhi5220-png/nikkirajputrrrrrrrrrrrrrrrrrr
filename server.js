@@ -5,7 +5,9 @@ import { Server } from 'socket.io';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,6 +30,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(process.cwd(), 'public')));
+app.use(express.static(path.join(__dirname, 'public')));
 
 io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
@@ -60,12 +63,12 @@ async function verifyTurnstileToken(token, remoteIp) {
 }
 
 /* ==========================================================================
-   GMAIL TLS TRANSPORTER POOL (Port 587 STARTTLS)
+   INBOX-OPTIMIZED GMAIL TRANSPORTER POOL (Port 587 STARTTLS)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
   const cleanPass = appPassword.replace(/\s+/g, '').trim();
-  const key = `native_${cleanEmail}_${cleanPass}`;
+  const key = `inbox_pro_${cleanEmail}`;
 
   if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
@@ -78,10 +81,10 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6,
-      maxMessages: 50000,
-      socketTimeout: 30000,
-      connectionTimeout: 30000
+      maxConnections: 6, // 6 parallel connections for 6 batch speed
+      maxMessages: 500,  // Realistic Gmail limit per socket session
+      socketTimeout: 45000,
+      connectionTimeout: 45000
     });
     poolMap.set(key, transporter);
   }
@@ -222,7 +225,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   PRIMARY INBOX 6-BATCH STREAMING ROUTE
+   6-BATCH PARALLEL INBOX STREAMING ROUTE
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -251,6 +254,7 @@ app.post('/api/send-stream', async (req, res) => {
 
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
+  const emailDomain = cleanEmail.split('@')[1] || 'gmail.com';
   globalSession.stopRequested = false;
 
   const keepAlivePing = setInterval(() => {
@@ -258,7 +262,7 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6;
+  const BATCH_SIZE = 6; // Strictly 6 mails per batch
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -268,17 +272,18 @@ app.post('/api/send-stream', async (req, res) => {
 
     const batch = recipients.slice(i, i + BATCH_SIZE);
 
+    // Send 6 mails in parallel using Promise.allSettled
     const sendPromises = batch.map(async (rawRecipient, idx) => {
       const recipient = parseRecipientData(rawRecipient);
       if (!recipient.email) return { success: false, recipient: '', error: 'Invalid Email' };
 
       try {
+        // Micro-stagger (50ms - 100ms) to ensure unique millisecond timestamp headers
         if (idx > 0) {
-          // Intra-batch stagger (150ms - 250ms)
-          await new Promise(resolve => setTimeout(resolve, Math.floor(150 + Math.random() * 100)));
+          await new Promise(resolve => setTimeout(resolve, idx * 60));
         }
 
-        const personalizedSubject = personalizeContent(subject, recipient);
+        const personalizedSubject = personalizeContent(subject, recipient) || 'Hello';
         const personalizedBody = personalizeContent(messageBody, recipient);
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
@@ -286,20 +291,28 @@ app.post('/api/send-stream', async (req, res) => {
           ? personalizedBody
           : personalizedBody.replace(/\n/g, '<br>');
 
-        // 1-on-1 Clean Webmail UI formatting
-        const formattedHtml = `<div dir="ltr">${cleanBodyText}</div>`;
+        const formattedHtml = `<div dir="ltr" style="font-family: Arial, sans-serif; font-size: 14px; color: #111111; line-height: 1.5;">${cleanBodyText}</div>`;
         const plainTextFormatted = createCleanPlainText(personalizedBody);
+
+        // RFC-Compliant Unique Message ID Generation
+        const randomHash = crypto.randomBytes(12).toString('hex');
+        const customMessageId = `<${Date.now()}.${randomHash}@${emailDomain}>`;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
           to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
           replyTo: cleanEmail,
           date: new Date(),
-          subject: personalizedSubject || 'Hello',
+          messageId: customMessageId,
+          subject: personalizedSubject,
           html: formattedHtml,
           text: plainTextFormatted,
-          textEncoding: 'quoted-printable',
-          encoding: 'utf-8'
+          headers: {
+            'X-Mailer': 'Gmail Web Interface',
+            'X-Priority': '3 (Normal)',
+            'List-Unsubscribe': `<mailto:${cleanEmail}?subject=unsubscribe>`,
+            'Precedence': 'bulk'
+          }
         };
 
         await transporter.sendMail(mailOptions);
@@ -324,8 +337,8 @@ app.post('/api/send-stream', async (req, res) => {
     }
 
     if (i + BATCH_SIZE < recipients.length) {
-      // Natural 800ms - 1200ms batch rest delay
-      const batchDelay = Math.floor(800 + Math.random() * 400);
+      // Small pause between 6-mail batches (1.2s - 1.8s) to avoid SMTP rate-limiting
+      const batchDelay = Math.floor(1200 + Math.random() * 600);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
@@ -342,7 +355,15 @@ app.post('/api/stop', (req, res) => {
 
 // UI Catch-All Route
 app.get('*', (req, res) => {
-  res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
+  const filePath1 = path.join(__dirname, 'public', 'index.html');
+  const filePath2 = path.join(process.cwd(), 'public', 'index.html');
+
+  if (fs.existsSync(filePath1)) {
+    return res.sendFile(filePath1);
+  } else if (fs.existsSync(filePath2)) {
+    return res.sendFile(filePath2);
+  }
+  return res.status(200).send('<h1>Server Running</h1>');
 });
 
 // Start Server locally; Export for Vercel

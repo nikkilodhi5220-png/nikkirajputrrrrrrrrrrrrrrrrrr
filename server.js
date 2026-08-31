@@ -3,8 +3,8 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,9 +17,7 @@ const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
-app.use(express.static(path.join(process.cwd(), "public")));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
@@ -28,7 +26,7 @@ app.use(express.static(path.join(__dirname, "public")));
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
   const cleanPass = appPassword.replace(/\s+/g, '').trim();
-  const key = `port587_${cleanEmail}`;
+  const key = `port587_${cleanEmail}_${cleanPass}`;
 
   if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
@@ -41,10 +39,10 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // Fast 6 parallel connection pool
+      maxConnections: 6, // Fast parallel processing
       maxMessages: 500,
-      socketTimeout: 30000,
-      connectionTimeout: 30000
+      socketTimeout: 20000,
+      connectionTimeout: 20000
     });
 
     poolMap.set(key, transporter);
@@ -56,6 +54,7 @@ function getPort587Transporter(email, appPassword) {
 /* ==========================================================================
    2. RECIPIENT PARSER, SPINTAX & CUSTOM CTAS
    ========================================================================== */
+
 function getOrganicCallToAction() {
   const ctas = [
     "Yes please do",
@@ -167,6 +166,10 @@ function createPlainTextFromHtml(html) {
 /* ==========================================================================
    3. API ROUTES
    ========================================================================== */
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 app.post('/api/auth', (req, res) => {
   const { password } = req.body;
   if (password === SITE_PASSWORD) {
@@ -191,14 +194,13 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. ULTRA-FAST INBOX BATCH STREAMING ENGINE (6 PARALLEL)
+   4. ULTRA-FAST INBOX BATCH STREAMING ENGINE
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
 
   const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
 
@@ -217,7 +219,10 @@ app.post('/api/send-stream', async (req, res) => {
   }, 3000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6; // Strictly 6 Mails Parallel
+
+  // 6 Mails ek saath parallelly bhejne ke liye Batching (24 mails in ~12-13 sec)
+  const BATCH_SIZE = 6;
+  const domain = cleanEmail.split('@')[1] || 'gmail.com';
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -227,31 +232,32 @@ app.post('/api/send-stream', async (req, res) => {
 
     const currentBatch = recipients.slice(i, i + BATCH_SIZE);
 
-    // Parallel execution for maximum speed and exact 6-batch sending
-    await Promise.allSettled(
-      currentBatch.map(async (rawRecipient, idx) => {
+    // Parallel send execution for maximum speed
+    await Promise.all(
+      currentBatch.map(async (rawRecipient) => {
         if (globalSession.stopRequested) return;
 
         const recipient = parseRecipientData(rawRecipient);
         if (!recipient.email) return;
 
         try {
-          // Micro stagger (30ms) to ensure distinct connection timestamps
-          if (idx > 0) {
-            await new Promise(resolve => setTimeout(resolve, idx * 30));
-          }
-
           const personalizedSubject = personalizeContent(subject, recipient);
           const personalizedBody = personalizeContent(messageBody, recipient);
           const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
           const customCTA = getOrganicCallToAction();
 
+          // Standard RFC Message-ID to pass Gmail DKIM & Spam filters
+          const customMessageId = `<${Date.now()}.${crypto.randomBytes(4).toString('hex')}@${domain}>`;
+
           const mailOptions = {
             from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
             to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
             replyTo: cleanEmail,
-            date: new Date(),
-            subject: personalizedSubject || 'Important Notice'
+            subject: personalizedSubject || 'Important Notice',
+            headers: {
+              'Message-ID': customMessageId,
+              'X-Entity-Ref-ID': crypto.randomBytes(8).toString('hex')
+            }
           };
 
           if (isHtml) {
@@ -284,9 +290,9 @@ app.post('/api/send-stream', async (req, res) => {
       })
     );
 
-    // Rest delay between 6-mail batches (800ms - 1200ms)
+    // Dynamic 800ms - 1500ms delay between batches for ~12-13 sec total runtime for 24 mails
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(800 + Math.random() * 400);
+      const batchDelay = Math.floor(800 + Math.random() * 700);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
@@ -301,24 +307,8 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: "Sending process stopped" });
 });
 
-// Vercel / Production UI Static Handler
-app.get('*', (req, res) => {
-  const filePath1 = path.join(__dirname, 'public', 'index.html');
-  const filePath2 = path.join(process.cwd(), 'public', 'index.html');
-
-  if (fs.existsSync(filePath1)) {
-    return res.sendFile(filePath1);
-  } else if (fs.existsSync(filePath2)) {
-    return res.sendFile(filePath2);
-  }
-  return res.status(200).send('<h1>Server Running</h1>');
+app.listen(PORT, () => {
+  console.log(`Server running on Port ${PORT} [High-Speed Inbox Engine Ready]`);
 });
-
-// Start Server for Local Execution; Export for Vercel Serverless
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-  app.listen(PORT, () => {
-    console.log(`Server running on Port ${PORT} [High-Speed Inbox Engine Ready]`);
-  });
-}
 
 export default app;

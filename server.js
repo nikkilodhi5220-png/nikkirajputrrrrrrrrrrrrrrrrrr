@@ -4,7 +4,6 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +20,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   1. HIGH-SPEED INBOX TRANSPORTER (MAX POOL CONNECTION)
+   1. SAFE GMAIL PORT 587 TRANSPORTER (STARTTLS)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -32,15 +31,15 @@ function getPort587Transporter(email, appPassword) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
       port: 587,
-      secure: false, // STARTTLS
+      secure: false, // Port 587 relies on STARTTLS (Safe Gmail standard)
       requireTLS: true,
       auth: {
         user: cleanEmail,
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // Fast parallel processing
-      maxMessages: 500,
+      maxConnections: 6, // 6 concurrent connections allowed
+      maxMessages: Infinity,
       socketTimeout: 20000,
       connectionTimeout: 20000
     });
@@ -52,9 +51,8 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   2. RECIPIENT PARSER, SPINTAX & CUSTOM CTAS
+   2. RECIPIENT PARSER & SPINTAX HELPERS
    ========================================================================== */
-
 function getOrganicCallToAction() {
   const ctas = [
     "Yes please do",
@@ -133,7 +131,6 @@ function personalizeContent(template, recipient) {
   if (!template) return "";
   let content = parseSpintax(template);
   const fallback = recipient.firstName || recipient.name || 'there';
-
   const currentDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
   content = content.replace(/{Name}/gi, recipient.name || fallback);
@@ -194,7 +191,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. ULTRA-FAST INBOX BATCH STREAMING ENGINE
+   4. STREAMING ENGINE (6 MAILS BATCH + 1-2 SEC GAP)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -220,9 +217,8 @@ app.post('/api/send-stream', async (req, res) => {
 
   const transporter = getPort587Transporter(email, appPassword);
 
-  // 6 Mails ek saath parallelly bhejne ke liye Batching (24 mails in ~12-13 sec)
+  // Exact 6 emails parallel sending speed
   const BATCH_SIZE = 6;
-  const domain = cleanEmail.split('@')[1] || 'gmail.com';
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -232,7 +228,7 @@ app.post('/api/send-stream', async (req, res) => {
 
     const currentBatch = recipients.slice(i, i + BATCH_SIZE);
 
-    // Parallel send execution for maximum speed
+    // Concurrent execution for 6 mails
     await Promise.all(
       currentBatch.map(async (rawRecipient) => {
         if (globalSession.stopRequested) return;
@@ -246,18 +242,11 @@ app.post('/api/send-stream', async (req, res) => {
           const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
           const customCTA = getOrganicCallToAction();
 
-          // Standard RFC Message-ID to pass Gmail DKIM & Spam filters
-          const customMessageId = `<${Date.now()}.${crypto.randomBytes(4).toString('hex')}@${domain}>`;
-
           const mailOptions = {
             from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
             to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
             replyTo: cleanEmail,
-            subject: personalizedSubject || 'Important Notice',
-            headers: {
-              'Message-ID': customMessageId,
-              'X-Entity-Ref-ID': crypto.randomBytes(8).toString('hex')
-            }
+            subject: personalizedSubject || 'Important Notice'
           };
 
           if (isHtml) {
@@ -290,10 +279,10 @@ app.post('/api/send-stream', async (req, res) => {
       })
     );
 
-    // Dynamic 800ms - 1500ms delay between batches for ~12-13 sec total runtime for 24 mails
+    // Exact 1 to 2 seconds random delay after 6 emails sent (1000ms - 2000ms)
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(800 + Math.random() * 700);
-      await new Promise(resolve => setTimeout(resolve, batchDelay));
+      const randomWait = Math.floor(Math.random() * 1000) + 1000;
+      await new Promise(resolve => setTimeout(resolve, randomWait));
     }
   }
 
@@ -308,7 +297,7 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on Port ${PORT} [High-Speed Inbox Engine Ready]`);
+  console.log(`Server running on Port ${PORT} [Safe Port 587 Stream Engine Active]`);
 });
 
 export default app;

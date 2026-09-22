@@ -4,6 +4,7 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -67,7 +68,7 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // Aligned with 6-batch processing
+      maxConnections: 6, // Exact 6 parallel connections for batch efficiency
       maxMessages: 4800,
       socketTimeout: 30000,
       connectionTimeout: 30000
@@ -219,7 +220,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   STREAMING DISPATCH ROUTE (6 Emails Per Batch)
+   STREAMING DISPATCH ROUTE (INBOX OPTIMIZED - SAME SPEED)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -247,6 +248,7 @@ app.post('/api/send-stream', async (req, res) => {
 
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
+  const senderDomain = cleanEmail.split('@')[1] || 'gmail.com';
   globalSession.stopRequested = false;
 
   const keepAlivePing = setInterval(() => {
@@ -254,7 +256,9 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6; // Exact 6 emails per batch
+  
+  // Speed bilkul same rakhi hai: Exact 6 emails per batch
+  const BATCH_SIZE = 6;
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -273,7 +277,6 @@ app.post('/api/send-stream', async (req, res) => {
         const personalizedBody = personalizeContent(messageBody, recipient);
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
-        // 2-line top gap + 15px font + #0f172a deep dark text
         let formattedHtml = '';
         if (isHtml) {
           formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody}</div>`;
@@ -281,7 +284,10 @@ app.post('/api/send-stream', async (req, res) => {
           formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
         }
 
-        const plainTextFormatted = `\n\n${createPlainTextFromHtml(formattedHtml)}`;
+        const plainTextFormatted = createPlainTextFromHtml(formattedHtml);
+
+        // Dynamic RFC Message-ID generation (Crucial for Inbox Placement)
+        const uniqueMsgId = `<${crypto.randomBytes(16).toString('hex')}@${senderDomain}>`;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
@@ -289,7 +295,14 @@ app.post('/api/send-stream', async (req, res) => {
           replyTo: cleanEmail,
           subject: personalizedSubject || 'No Subject',
           html: formattedHtml,
-          text: plainTextFormatted
+          text: plainTextFormatted,
+          headers: {
+            'Message-ID': uniqueMsgId,
+            'Auto-Submitted': 'auto-generated',
+            'X-Mailer': 'NodeMailer Standard Client'
+          },
+          textEncoding: 'quoted-printable',
+          encoding: 'utf-8'
         };
 
         await transporter.sendMail(mailOptions);
@@ -308,7 +321,7 @@ app.post('/api/send-stream', async (req, res) => {
       }
     }
 
-    // Delay between 6-email batches
+    // Speed same: 350ms - 400ms delay between 6-email batches
     if (i + BATCH_SIZE < recipients.length) {
       const batchDelay = Math.floor(350 + Math.random() * 50);
       await new Promise(resolve => setTimeout(resolve, batchDelay));

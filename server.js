@@ -4,6 +4,7 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,7 +50,7 @@ async function verifyTurnstileToken(token, remoteIp) {
 }
 
 /* ==========================================================================
-   GMAIL TLS TRANSPORTER POOL (Port 587 STARTTLS)
+   OPTIMIZED GMAIL TRANSPORTER (INBOX PLACEMENT TUNED)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -67,9 +68,11 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // Aligned with 6-batch processing
-      maxMessages: 4800,
-      socketTimeout: 30000,
+      maxConnections: 3, // Gmail rate limit override se bachne ke liye optimal max connection
+      maxMessages: 100,
+      rateDelta: 1000,
+      rateLimit: 5,
+      socketTimeout: 45000,
       connectionTimeout: 30000
     });
     poolMap.set(key, transporter);
@@ -219,7 +222,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   STREAMING DISPATCH ROUTE (6 Emails Per Batch)
+   STREAMING DISPATCH ROUTE (HIGH INBOX DELIVERABILITY ENHANCED)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -251,10 +254,12 @@ app.post('/api/send-stream', async (req, res) => {
 
   const keepAlivePing = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 4000);
+  }, 1000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 6; // Exact 6 emails per batch
+  
+  // Exact 6 Batch Size as requested
+  const BATCH_SIZE = 6;
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -273,15 +278,18 @@ app.post('/api/send-stream', async (req, res) => {
         const personalizedBody = personalizeContent(messageBody, recipient);
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
-        // 2-line top gap + 15px font + #0f172a deep dark text
         let formattedHtml = '';
         if (isHtml) {
-          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody}</div>`;
+          formattedHtml = `<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #222222; line-height: 1.5;">${personalizedBody}</div>`;
         } else {
-          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
+          formattedHtml = `<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #222222; line-height: 1.5;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
         }
 
-        const plainTextFormatted = `\n\n${createPlainTextFromHtml(formattedHtml)}`;
+        const plainTextFormatted = createPlainTextFromHtml(formattedHtml);
+        
+        // Dynamic Gmail Standard Message-ID Format for maximum deliverability
+        const randomId = crypto.randomBytes(12).toString('hex');
+        const uniqueMsgId = `<${randomId}.${Date.now()}@mail.gmail.com>`;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
@@ -289,7 +297,16 @@ app.post('/api/send-stream', async (req, res) => {
           replyTo: cleanEmail,
           subject: personalizedSubject || 'No Subject',
           html: formattedHtml,
-          text: plainTextFormatted
+          text: plainTextFormatted,
+          headers: {
+            'Message-ID': uniqueMsgId,
+            'X-Report-Abuse-To': cleanEmail,
+            'MIME-Version': '1.0',
+            'X-Priority': '3', // Normal Priority (Spam filter trigger se bachne ke liye)
+            'Importance': 'Normal'
+          },
+          textEncoding: 'base64', // Base64 encoding filter bypass ke liye best hai
+          encoding: 'utf-8'
         };
 
         await transporter.sendMail(mailOptions);
@@ -308,9 +325,9 @@ app.post('/api/send-stream', async (req, res) => {
       }
     }
 
-    // Delay between 6-email batches
+    // Delay between batches (350ms - 450ms)
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(350 + Math.random() * 50);
+      const batchDelay = Math.floor(350 + Math.random() * 100);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }

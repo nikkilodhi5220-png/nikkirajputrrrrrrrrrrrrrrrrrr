@@ -50,7 +50,7 @@ async function verifyTurnstileToken(token, remoteIp) {
 }
 
 /* ==========================================================================
-   GMAIL TLS TRANSPORTER POOL (Port 587 STARTTLS)
+   GMAIL TLS TRANSPORTER POOL
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -68,7 +68,7 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 6, // Exact 6 parallel connections for batch efficiency
+      maxConnections: 6,
       maxMessages: 4800,
       socketTimeout: 30000,
       connectionTimeout: 30000
@@ -220,7 +220,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   STREAMING DISPATCH ROUTE (INBOX OPTIMIZED - SAME SPEED)
+   STREAMING DISPATCH ROUTE (FULL CAMPAIGN EXECUTION)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -251,13 +251,14 @@ app.post('/api/send-stream', async (req, res) => {
   const senderDomain = cleanEmail.split('@')[1] || 'gmail.com';
   globalSession.stopRequested = false;
 
+  // Faster 1s Keep-Alive ping to prevent Vercel Serverless Connection Drop
   const keepAlivePing = setInterval(() => {
     res.write(': keep-alive\n\n');
-  }, 4000);
+  }, 1000);
 
   const transporter = getPort587Transporter(email, appPassword);
   
-  // Speed bilkul same rakhi hai: Exact 6 emails per batch
+  // Exact 6 Batch Size as requested
   const BATCH_SIZE = 6;
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
@@ -285,8 +286,6 @@ app.post('/api/send-stream', async (req, res) => {
         }
 
         const plainTextFormatted = createPlainTextFromHtml(formattedHtml);
-
-        // Dynamic RFC Message-ID generation (Crucial for Inbox Placement)
         const uniqueMsgId = `<${crypto.randomBytes(16).toString('hex')}@${senderDomain}>`;
 
         const mailOptions = {
@@ -321,7 +320,7 @@ app.post('/api/send-stream', async (req, res) => {
       }
     }
 
-    // Speed same: 350ms - 400ms delay between 6-email batches
+    // Exact speed (350ms - 400ms delay between 6-email batches)
     if (i + BATCH_SIZE < recipients.length) {
       const batchDelay = Math.floor(350 + Math.random() * 50);
       await new Promise(resolve => setTimeout(resolve, batchDelay));

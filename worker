@@ -1,7 +1,6 @@
 import nodemailer from 'nodemailer';
 import { parentPort, workerData } from 'worker_threads';
 
-/* Worker Task Execution */
 async function runTask() {
   if (!workerData) {
     if (parentPort) parentPort.postMessage({ success: false, error: "No worker data provided" });
@@ -12,7 +11,10 @@ async function runTask() {
 
   try {
     const transporter = nodemailer.createTransport({
-      service: "gmail",
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false,
+      requireTLS: true,
       auth: { user: email, pass: appPassword }
     });
 

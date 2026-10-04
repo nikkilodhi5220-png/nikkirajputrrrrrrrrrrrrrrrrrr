@@ -3,6 +3,7 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 
@@ -16,10 +17,16 @@ const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
+// Dynamic Path Resolution for Public Directory
+const publicPath = path.join(__dirname, 'public');
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+
+if (fs.existsSync(publicPath)) {
+  app.use(express.static(publicPath));
+}
 
 /* ==========================================================================
    1. GMAIL TRANSPORTER (ENHANCED SMTP POOL & SSL)
@@ -210,12 +217,8 @@ function stripHtmlTags(htmlString) {
 }
 
 /* ==========================================================================
-   3. API ROUTES
+   3. API & FRONTEND ROUTES
    ========================================================================== */
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
 app.post('/api/auth', (req, res) => {
   const { password } = req.body;
   if (password === SITE_PASSWORD) return res.json({ success: true, message: 'Authorized' });
@@ -322,7 +325,6 @@ app.post('/api/send-stream', async (req, res) => {
           ? `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #111827; line-height: 1.5;">${personalizedBody}</div>`
           : `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #111827; line-height: 1.5;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
 
-        // Unique Message-ID generation to avoid spam filters
         const randomHex = crypto.randomBytes(12).toString('hex');
         const customMessageId = `<${Date.now()}.${randomHex}@${domainPart}>`;
 
@@ -370,6 +372,31 @@ app.post('/api/stop', (req, res) => {
   globalSession.stopRequested = true;
   closeAllPools();
   res.json({ success: true, message: 'Stopped by User' });
+});
+
+/* ==========================================================================
+   5. PAGE SERVING & WILDCARD CATCH-ALL (PREVENTS "PAGE UNAVAILABLE")
+   ========================================================================== */
+app.get('*', (req, res) => {
+  const indexPath = path.join(publicPath, 'index.html');
+  const rootIndexPath = path.join(__dirname, 'index.html');
+
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  } else if (fs.existsSync(rootIndexPath)) {
+    return res.sendFile(rootIndexPath);
+  } else {
+    return res.status(200).send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Secure Mail Console</title></head>
+        <body style="font-family: sans-serif; display: grid; place-content: center; height: 100vh; background: #0f172a; color: #fff;">
+          <h2>Server Active & Ready</h2>
+          <p>Please place your <code>index.html</code>, <code>script.js</code>, and <code>style.css</code> inside the <code>public/</code> directory.</p>
+        </body>
+      </html>
+    `);
+  }
 });
 
 app.listen(PORT, () => {

@@ -4,6 +4,7 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +22,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 /* ==========================================================================
-   1. CLEAN DIRECT GMAIL TRANSPORTER (NO PROXY, PROPER POOL REUSE)
+   1. GMAIL TRANSPORTER (ENHANCED SMTP POOL & SSL)
    ========================================================================== */
 function closeAllPools() {
   for (const [key, transporter] of poolMap.entries()) {
@@ -40,7 +41,6 @@ function getNativeTransporter(email, appPassword) {
   const senderDomain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : 'gmail.com';
   const key = `native_${cleanEmail}_${cleanPass}`;
 
-  // Close old pool if switching to a different Gmail account
   for (const [existingKey, existingTransporter] of poolMap.entries()) {
     if (existingKey !== key) {
       try {
@@ -63,10 +63,10 @@ function getNativeTransporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 4,
-      maxMessages: 100,
-      socketTimeout: 30000,
-      connectionTimeout: 30000,
+      maxConnections: 5,
+      maxMessages: 200,
+      socketTimeout: 20000,
+      connectionTimeout: 20000,
       tls: {
         rejectUnauthorized: true,
         minVersion: 'TLSv1.2'
@@ -164,11 +164,11 @@ function extractTemplateDeck(rawTemplate) {
     const lines = cleanRaw
       .split(/\r?\n/)
       .map(l => l.trim())
-      .filter(l => l.length > 15);
+      .filter(l => l.length > 10);
 
     const looksLikeVariationList =
       lines.length >= 2 &&
-      lines.filter(l => /^(hi|hello|hey|your|good\s)/i.test(l)).length >= Math.ceil(lines.length * 0.6);
+      lines.filter(l => /^(hi|hello|hey|your|good\s|i\s|we\s)/i.test(l)).length >= Math.ceil(lines.length * 0.5);
 
     if (looksLikeVariationList) {
       return shuffleArray(lines);
@@ -182,10 +182,10 @@ function personalizeContent(template, recipient) {
   if (!template) return '';
   let content = parseSpintax(template);
 
-  const displayName = recipient.name || recipient.firstName || 'there';
-  const displayFirstName = recipient.firstName || displayName;
+  const displayName = recipient.name || recipient.firstName || '';
+  const displayFirstName = recipient.firstName || displayName || 'there';
 
-  content = content.replace(/{Name}/gi, displayName);
+  content = content.replace(/{Name}/gi, displayName ? displayName : 'there');
   content = content.replace(/{FirstName}/gi, displayFirstName);
   content = content.replace(/{First_Name}/gi, displayFirstName);
   content = content.replace(/{Email}/gi, recipient.email);
@@ -247,7 +247,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   4. NON-STOP STREAMING ROUTE (BLITZ SIZE = 4)
+   4. INBOX-OPTIMIZED STREAMING ROUTE (BLITZ SIZE = 4)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -265,6 +265,7 @@ app.post('/api/send-stream', async (req, res) => {
 
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
+  const domainPart = cleanEmail.split('@')[1] || 'gmail.com';
   globalSession.stopRequested = false;
 
   const keepAlivePing = setInterval(() => {
@@ -275,8 +276,8 @@ app.post('/api/send-stream', async (req, res) => {
     }
   }, 2500);
 
-  const defaultSubject = '{Quick question|Site Overview|Quick note}';
-  const defaultBody = `Your site looks great, but a small issue is keeping it from showing in the top results. Can I send a screenshot?`;
+  const defaultSubject = '{Quick inquiry|Regarding {Domain}|Quick note for {Name}}';
+  const defaultBody = `Hi {FirstName},\n\nI noticed a quick detail on {Domain} that could be improved. Would you be open to seeing a brief overview?\n\nBest regards`;
 
   const finalSubjectTemplate = (subject && subject.trim()) ? subject : defaultSubject;
   const rawBodyTemplate = (messageBody && messageBody.trim()) ? messageBody : defaultBody;
@@ -284,7 +285,6 @@ app.post('/api/send-stream', async (req, res) => {
   let templateDeck = extractTemplateDeck(rawBodyTemplate);
   let deckIndex = 0;
 
-  // Single shared connection pool for the entire session (fixes per-email login flood)
   const transporter = getNativeTransporter(email, appPassword);
   const BLITZ_SIZE = 4;
 
@@ -310,21 +310,36 @@ app.post('/api/send-stream', async (req, res) => {
 
       try {
         if (idx > 0) {
-          await new Promise(resolve => setTimeout(resolve, idx * 90));
+          await new Promise(resolve => setTimeout(resolve, idx * 80));
         }
 
         const personalizedSubject = personalizeContent(finalSubjectTemplate, recipient);
         const personalizedBody = personalizeContent(selectedBodyLine, recipient);
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
+        const cleanTextContent = isHtml ? stripHtmlTags(personalizedBody) : personalizedBody;
+        const htmlFormatted = isHtml
+          ? `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #111827; line-height: 1.5;">${personalizedBody}</div>`
+          : `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #111827; line-height: 1.5;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
+
+        // Unique Message-ID generation to avoid spam filters
+        const randomHex = crypto.randomBytes(12).toString('hex');
+        const customMessageId = `<${Date.now()}.${randomHex}@${domainPart}>`;
+
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
           to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
           replyTo: cleanEmail,
           subject: personalizedSubject,
+          messageId: customMessageId,
           textEncoding: 'quoted-printable',
-          text: isHtml ? stripHtmlTags(personalizedBody) : personalizedBody,
-          html: isHtml ? `<div dir="ltr">${personalizedBody}</div>` : `<div dir="ltr">${personalizedBody.replace(/\n/g, '<br>')}</div>`
+          text: cleanTextContent,
+          html: htmlFormatted,
+          headers: {
+            'X-Mailer': 'GmailWebConsole',
+            'X-Priority': '3',
+            'Importance': 'normal'
+          }
         };
 
         await transporter.sendMail(mailOptions);
@@ -341,7 +356,7 @@ app.post('/api/send-stream', async (req, res) => {
     await Promise.allSettled(blitzTasks);
 
     if (i + BLITZ_SIZE < recipients.length && !globalSession.stopRequested) {
-      await new Promise(resolve => setTimeout(resolve, 180));
+      await new Promise(resolve => setTimeout(resolve, 150));
     }
   }
 

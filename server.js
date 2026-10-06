@@ -3,6 +3,7 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,7 +19,10 @@ const poolMap = new Map();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+
+// Serve static files from 'public' folder
+const publicPath = path.join(__dirname, 'public');
+app.use(express.static(publicPath));
 
 /* ==========================================================================
    1. GMAIL TRANSPORTER POOLING (CLEAN TLS CONFIG)
@@ -209,10 +213,6 @@ function stripHtmlTags(htmlString) {
 /* ==========================================================================
    3. API ROUTES
    ========================================================================== */
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
 app.post('/api/auth', (req, res) => {
   const { password } = req.body;
   if (password === SITE_PASSWORD) return res.json({ success: true, message: 'Authorized' });
@@ -226,137 +226,4 @@ app.post('/api/verify', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Credentials required' });
   }
 
-  const cleanPass = appPassword.replace(/\s+/g, '').trim();
-  if (cleanPass.length !== 16) {
-    return res.status(400).json({ success: false, message: 'App Password must be 16 characters' });
-  }
-
-  try {
-    const transporter = getNativeTransporter(email, appPassword);
-    await transporter.verify();
-    return res.json({ success: true, message: 'SMTP ready' });
-  } catch (error) {
-    return res.status(401).json({
-      success: false,
-      message: error.message || 'SMTP Auth Failed. Check 16-char App Password.'
-    });
-  }
-});
-
-/* ==========================================================================
-   4. STREAMING ROUTE (SAME SPEED LOGIC MAINTAINED: BLITZ = 4)
-   ========================================================================== */
-app.post('/api/send-stream', async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-
-  const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
-
-  if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
-    res.write(`data: ${JSON.stringify({ success: false, error: 'Invalid Request Data' })}\n\n`);
-    res.end();
-    return;
-  }
-
-  const cleanEmail = email.toLowerCase().trim();
-  const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
-  globalSession.stopRequested = false;
-
-  const keepAlivePing = setInterval(() => {
-    try {
-      res.write(': keep-alive\n\n');
-    } catch (e) {
-      // Ignored
-    }
-  }, 2500);
-
-  const defaultSubject = 'Quick question';
-  const defaultBody = 'Hi {FirstName},\n\nI noticed a quick detail on {Domain} that could be improved. Would you be open to seeing a brief overview?\n\nBest regards';
-
-  const finalSubjectTemplate = (subject && subject.trim()) ? subject : defaultSubject;
-  const rawBodyTemplate = (messageBody && messageBody.trim()) ? messageBody : defaultBody;
-
-  let templateDeck = extractTemplateDeck(rawBodyTemplate);
-  let deckIndex = 0;
-
-  const transporter = getNativeTransporter(email, appPassword);
-  const BLITZ_SIZE = 4; // Maintained original speed setting
-
-  for (let i = 0; i < recipients.length; i += BLITZ_SIZE) {
-    if (globalSession.stopRequested) {
-      res.write(`data: ${JSON.stringify({ success: false, error: 'Stopped by User' })}\n\n`);
-      break;
-    }
-
-    const blitzBatch = recipients.slice(i, i + BLITZ_SIZE);
-
-    const blitzTasks = blitzBatch.map(async (rawRecipient, idx) => {
-      if (globalSession.stopRequested) return;
-
-      const recipient = parseRecipientData(rawRecipient);
-      if (!recipient.email) return;
-
-      // Race-condition free index selection
-      const selectedBodyLine = templateDeck[deckIndex % templateDeck.length];
-      deckIndex++;
-
-      try {
-        if (idx > 0) {
-          await new Promise(resolve => setTimeout(resolve, idx * 80)); // 80ms offset retained
-        }
-
-        const personalizedSubject = personalizeContent(finalSubjectTemplate, recipient);
-        const personalizedBody = personalizeContent(selectedBodyLine, recipient);
-        const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
-
-        const cleanTextContent = isHtml ? stripHtmlTags(personalizedBody) : personalizedBody;
-
-        const mailOptions = {
-          from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
-          to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
-          replyTo: cleanEmail,
-          subject: personalizedSubject,
-          text: cleanTextContent
-        };
-
-        if (isHtml) {
-          mailOptions.html = personalizedBody;
-        }
-
-        await transporter.sendMail(mailOptions);
-
-        const successData = { success: true, recipient: recipient.email, name: recipient.name };
-        res.write(`data: ${JSON.stringify(successData)}\n\n`);
-
-      } catch (err) {
-        const failData = { success: false, recipient: recipient.email, error: err.message };
-        res.write(`data: ${JSON.stringify(failData)}\n\n`);
-      }
-    });
-
-    await Promise.allSettled(blitzTasks);
-
-    if (i + BLITZ_SIZE < recipients.length && !globalSession.stopRequested) {
-      await new Promise(resolve => setTimeout(resolve, 150)); // 150ms inter-batch delay retained
-    }
-  }
-
-  closeAllPools();
-  clearInterval(keepAlivePing);
-  res.write('data: [DONE]\n\n');
-  res.end();
-});
-
-app.post('/api/stop', (req, res) => {
-  globalSession.stopRequested = true;
-  closeAllPools();
-  res.json({ success: true, message: 'Stopped by User' });
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Mailer running on port ${PORT}`);
-});
-
-export default app;
+  const cleanPass = appPassword.replace(/\s+/g,

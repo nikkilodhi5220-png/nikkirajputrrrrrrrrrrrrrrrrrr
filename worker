@@ -12,19 +12,25 @@ async function runTask() {
   try {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,
-      requireTLS: true,
-      auth: { user: email, pass: appPassword }
+      port: 465,
+      secure: true,
+      auth: { user: email, pass: appPassword },
+      tls: { rejectUnauthorized: true }
     });
 
-    const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
+    const cleanSenderName = (senderName || "").replace(/["\r\n]/g, "").trim();
+    const cleanEmail = email.toLowerCase().trim();
 
     const mailOptions = {
-      from: cleanSenderName ? `"${cleanSenderName}" <${email}>` : email,
+      from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
       to: recipient,
       subject: subject,
-      text: messageBody
+      text: messageBody,
+      headers: {
+        'X-Mailer': 'Nodemailer Express Engine',
+        'X-Priority': '3',
+        'Importance': 'normal'
+      }
     };
 
     const info = await transporter.sendMail(mailOptions);

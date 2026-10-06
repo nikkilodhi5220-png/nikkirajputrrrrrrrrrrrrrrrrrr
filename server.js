@@ -12,46 +12,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
-const globalSession = { stopRequested: false };
-const poolMap = new Map();
-
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
-
-function closeAllPools() {
-  for (const [key, transporter] of poolMap.entries()) {
-    try {
-      transporter.close();
-    } catch (e) {}
-    poolMap.delete(key);
-  }
-}
-
-function getNativeTransporter(email, appPassword) {
-  const cleanEmail = email.toLowerCase().trim();
-  const cleanPass = appPassword.replace(/\s+/g, '').trim();
-  const senderDomain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : 'gmail.com';
-  const key = `native_${cleanEmail}_${cleanPass}`;
-
-  if (!poolMap.has(key)) {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
-      name: senderDomain,
-      auth: { user: cleanEmail, pass: cleanPass },
-      pool: false, // Vercel serverless functions par pool: false zyaada stable chalta hai
-      socketTimeout: 10000,
-      connectionTimeout: 10000,
-      tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
-    });
-    poolMap.set(key, transporter);
-  }
-
-  return poolMap.get(key);
-}
 
 function parseRecipientData(input) {
   let email = '';
@@ -113,29 +77,6 @@ function parseSpintax(text) {
   return spun.replace(/[\{\}]/g, '').trim();
 }
 
-function shuffleArray(array) {
-  const arr = [...array];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
-function extractTemplateDeck(rawTemplate) {
-  if (!rawTemplate) return [''];
-  const isHtml = /<[a-z][\s\S]*>/i.test(rawTemplate);
-  const cleanRaw = String(rawTemplate).trim();
-
-  if (!isHtml) {
-    const lines = cleanRaw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 10);
-    const looksLikeVariationList = lines.length >= 2 && lines.filter(l => /^(hi|hello|hey|your|good\s)/i.test(l)).length >= Math.ceil(lines.length * 0.5);
-    if (looksLikeVariationList) return shuffleArray(lines);
-  }
-
-  return [cleanRaw];
-}
-
 function personalizeContent(template, recipient) {
   if (!template) return '';
   let content = parseSpintax(template);
@@ -170,4 +111,110 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.post('/api/auth', (req, res)
+app.post('/api/auth', (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (password === SITE_PASSWORD) return res.json({ success: true, message: 'Authorized' });
+    return res.status(401).json({ success: false, message: 'Unauthorized Password' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/verify', async (req, res) => {
+  try {
+    const { email, appPassword } = req.body || {};
+    if (!email || !appPassword) return res.status(400).json({ success: false, message: 'Credentials required' });
+
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanPass = appPassword.replace(/\s+/g, '').trim();
+
+    if (cleanPass.length !== 16) return res.status(400).json({ success: false, message: 'App Password must be 16 characters' });
+
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: { user: cleanEmail, pass: cleanPass },
+      connectionTimeout: 5000
+    });
+
+    await transporter.verify();
+    return res.json({ success: true, message: 'SMTP Ready' });
+  } catch (error) {
+    return res.status(401).json({ success: false, message: error.message || 'SMTP Auth Failed' });
+  }
+});
+
+// Fast & Safe Sending Endpoint (Vercel Timeout Proof)
+app.post('/api/send-stream', async (req, res) => {
+  try {
+    const { email, appPassword, senderName, subject, messageBody, recipients } = req.body || {};
+
+    if (!email || !appPassword || !Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ success: false, error: 'Invalid Request Data' });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanPass = appPassword.replace(/\s+/g, '').trim();
+    const cleanSenderName = (senderName || '').replace(/["\r\n]/g, '').trim();
+
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: { user: cleanEmail, pass: cleanPass },
+      pool: true,
+      maxConnections: 5, // High speed parallel connections
+      socketTimeout: 10000
+    });
+
+    const defaultSubject = '{Quick question|Site Overview|Quick note}';
+    const defaultBody = `Your site looks great, but a small issue is keeping it from showing in the top results.`;
+
+    const finalSubjectTemplate = (subject && subject.trim()) ? subject : defaultSubject;
+    const rawBodyTemplate = (messageBody && messageBody.trim()) ? messageBody : defaultBody;
+    const domain = cleanEmail.split('@')[1] || 'gmail.com';
+
+    // Parallel Processing for Maximum Speed
+    const sendPromises = recipients.map(async (rawRecipient) => {
+      const recipient = parseRecipientData(rawRecipient);
+      if (!recipient.email) return { success: false, error: 'Invalid recipient email' };
+
+      try {
+        const personalizedSubject = personalizeContent(finalSubjectTemplate, recipient);
+        const personalizedBody = personalizeContent(rawBodyTemplate, recipient);
+        const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
+
+        const mailOptions = {
+          from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+          to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+          replyTo: cleanEmail,
+          subject: personalizedSubject,
+          text: isHtml ? stripHtmlTags(personalizedBody) : personalizedBody,
+          html: isHtml 
+            ? `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #333333; line-height: 1.5;">${personalizedBody}</div>` 
+            : `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #333333; line-height: 1.5;">${personalizedBody.replace(/\n/g, '<br>')}</div>`,
+          headers: {
+            'Message-ID': `<${Date.now()}.${Math.random().toString(36).substring(2, 8)}@${domain}>`,
+            'X-Mailer': 'Microsoft Outlook 16.0',
+            'Precedence': 'bulk',
+            'List-Unsubscribe': `<mailto:${cleanEmail}?subject=unsubscribe>`
+          }
+        };
+
+        await transporter.sendMail(mailOptions);
+        return { success: true, recipient: recipient.email };
+      } catch (err) {
+        return { success: false, recipient: recipient.email, error: err.message };
+      }
+    });
+
+    const results = await Promise.allSettled(sendPromises);
+    transporter.close();
+
+    // Stream log compatible response
+    res.setHeader('Content-Type', 'text/event-stream');
+    results.forEach((resItem) => {
+      if (resItem.status === 'fulfilled') {
+        res.write(`data

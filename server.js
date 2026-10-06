@@ -35,13 +35,6 @@ function getNativeTransporter(email, appPassword) {
   const senderDomain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : 'gmail.com';
   const key = `native_${cleanEmail}_${cleanPass}`;
 
-  for (const [existingKey, existingTransporter] of poolMap.entries()) {
-    if (existingKey !== key) {
-      try { existingTransporter.close(); } catch (e) {}
-      poolMap.delete(existingKey);
-    }
-  }
-
   if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
@@ -49,11 +42,9 @@ function getNativeTransporter(email, appPassword) {
       secure: true,
       name: senderDomain,
       auth: { user: cleanEmail, pass: cleanPass },
-      pool: true,
-      maxConnections: 1, // High inbox placement ke liye single connection best hai
-      maxMessages: 50,
-      socketTimeout: 30000,
-      connectionTimeout: 30000,
+      pool: false, // Vercel serverless functions par pool: false zyaada stable chalta hai
+      socketTimeout: 10000,
+      connectionTimeout: 10000,
       tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
     });
     poolMap.set(key, transporter);
@@ -148,4 +139,35 @@ function extractTemplateDeck(rawTemplate) {
 function personalizeContent(template, recipient) {
   if (!template) return '';
   let content = parseSpintax(template);
-  const displayName = recipient.name || recipient.firstName
+  const displayName = recipient.name || recipient.firstName || 'there';
+  const displayFirstName = recipient.firstName || displayName;
+
+  content = content.replace(/{Name}/gi, displayName);
+  content = content.replace(/{FirstName}/gi, displayFirstName);
+  content = content.replace(/{First_Name}/gi, displayFirstName);
+  content = content.replace(/{Email}/gi, recipient.email);
+  content = content.replace(/{Domain}/gi, recipient.domain);
+
+  return content.trim();
+}
+
+function stripHtmlTags(htmlString) {
+  return htmlString
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.post('/api/auth', (req, res)

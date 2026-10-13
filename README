@@ -1,8 +1,0 @@
-# Secure Mail Console
-
-Node.js application for sending emails via SMTP using Nodemailer with support for Spintax parsing and real-time streaming updates.
-
-## Setup Instructions
-1. Install dependencies: `npm install`
-2. Create `.env` file with `SITE_PASSWORD` and `PORT`.
-3. Run locally: `npm start` or `npm run dev`

@@ -57,7 +57,7 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 SMTP_TIMEOUT = 20
 MAX_RECIPIENTS = 25
-MAX_WORKERS = 4
+MAX_WORKERS = 3
 SEND_DELAY_SECONDS = 0
 
 EMAIL_RE = re.compile(
@@ -137,10 +137,8 @@ def personalize(value, recipient):
 
 
 def verify_turnstile(token, remote_ip=None):
-    # Turnstile secret configured nahi hai to block nahi karega
     if not TURNSTILE_SECRET_KEY:
         return True, None
-    # Token bheja gaya hai tabhi verify karega; agar UI widget load nahi hua to fallback allow
     if not token:
         return True, None
 
@@ -173,7 +171,6 @@ def build_message(gmail_clean, domain, sender_name, subject, body, is_html, reci
     msg["Reply-To"] = gmail_clean
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=domain)
-    msg["List-Unsubscribe"] = f"<mailto:{gmail_clean}?subject=unsubscribe>"
 
     content = personalize(body, recipient)
     if is_html:

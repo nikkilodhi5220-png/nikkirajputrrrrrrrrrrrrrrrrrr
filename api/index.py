@@ -6,6 +6,8 @@ import hmac
 import html
 import random
 import smtplib
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import timedelta
 from email.message import EmailMessage
@@ -34,6 +36,9 @@ handler = app
 
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip()
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip()
+TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
+TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
+
 if len(SESSION_SECRET) < 32:
     raise RuntimeError("Set SESSION_SECRET to a random value of at least 32 characters.")
 if not LOGIN_PASSWORD:
@@ -129,6 +134,33 @@ def personalize(value, recipient):
     for key in ("hi", "hello", "thanks", "name", "email", "ref_code"):
         result = result.replace("{{" + key + "}}", recipient.get(key, ""))
     return result
+
+
+def verify_turnstile(token, remote_ip=None):
+    if not TURNSTILE_SECRET_KEY:
+        return True, None
+    if not token:
+        return False, "Cloudflare verification is required."
+
+    payload = {"secret": TURNSTILE_SECRET_KEY, "response": token}
+    if remote_ip:
+        payload["remoteip"] = remote_ip
+
+    encoded = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("success") is True:
+            return True, None
+        return False, "Cloudflare verification failed."
+    except Exception:
+        return False, "Unable to verify Cloudflare."
 
 
 def build_message(gmail_clean, domain, sender_name, subject, body, is_html, recipient):
@@ -255,9 +287,16 @@ def login():
     if logged_in():
         return redirect(url_for("home"))
     if request.method == "GET":
-        return render_template("login.html", error=None)
+        return render_template("login.html", error=None, turnstile_site_key=TURNSTILE_SITE_KEY)
     if not hmac.compare_digest(str(request.form.get("password", "")), LOGIN_PASSWORD):
-        return render_template("login.html", error="Incorrect password."), 401
+        return (
+            render_template(
+                "login.html",
+                error="Incorrect password.",
+                turnstile_site_key=TURNSTILE_SITE_KEY,
+            ),
+            401,
+        )
     session.clear()
     session.permanent = True
     session["authenticated"] = True
@@ -274,7 +313,7 @@ def logout():
 def home():
     if not logged_in():
         return redirect(url_for("login"))
-    return render_template("index.html")
+    return render_template("index.html", turnstile_site_key=TURNSTILE_SITE_KEY)
 
 
 @app.route("/health")
@@ -324,6 +363,7 @@ def send_batch():
     body = str(data.get("body", ""))
     is_html = data.get("is_html") is True
     incoming = data.get("recipients", [])
+    turnstile_token = str(data.get("turnstile_token", "")).strip()
 
     if not sender_name or not valid_email(gmail) or not gmail.endswith("@gmail.com"):
         return error("Enter a sender name and valid @gmail.com address.")
@@ -333,8 +373,12 @@ def send_batch():
         return error("Email body is too large.")
     if not isinstance(incoming, list):
         return error("Recipients must be a list.")
-    if data.get("consent_confirmed") is not True:
-        return error("Confirm recipients have permission to receive this email.")
+
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    remote_ip = forwarded_for.split(",", 1)[0].strip() if forwarded_for else request.remote_addr
+    verified, verify_error = verify_turnstile(turnstile_token, remote_ip)
+    if not verified:
+        return error(verify_error, 403)
 
     recipients, seen, invalid = [], set(), 0
     for item in incoming:
@@ -414,7 +458,7 @@ def send_batch():
             {
                 "type": "complete",
                 "success": failed == 0,
-                "message": "Sending attempt finished. SMTP acceptance does not prove Inbox delivery.",
+                "message": "Sending attempt finished.",
                 "total": total,
                 "sent": sent,
                 "failed": failed,

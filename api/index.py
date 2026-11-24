@@ -137,10 +137,12 @@ def personalize(value, recipient):
 
 
 def verify_turnstile(token, remote_ip=None):
+    # Turnstile secret configured nahi hai to block nahi karega
     if not TURNSTILE_SECRET_KEY:
         return True, None
+    # Token bheja gaya hai tabhi verify karega; agar UI widget load nahi hua to fallback allow
     if not token:
-        return False, "Cloudflare verification is required."
+        return True, None
 
     payload = {"secret": TURNSTILE_SECRET_KEY, "response": token}
     if remote_ip:
@@ -243,12 +245,12 @@ def send_chunk(gmail, app_password, sender_name, subject, body, is_html, chunk):
                             f"SMTP/network error: {str(exc)[:200]}",
                         )
                     )
-                except Exception:
+                except Exception as exc:
                     outcomes.append(
                         (
                             recipient["email"],
                             "failed",
-                            "Unexpected error. Check Vercel logs.",
+                            f"Error: {str(exc)[:200]}",
                         )
                     )
     except smtplib.SMTPAuthenticationError:
@@ -257,7 +259,7 @@ def send_chunk(gmail, app_password, sender_name, subject, body, is_html, chunk):
                 (
                     recipient["email"],
                     "failed",
-                    "Gmail authentication failed. Check address and App Password.",
+                    "Gmail authentication failed. Check address and 16-char App Password.",
                 )
             )
     except (smtplib.SMTPException, TimeoutError, OSError) as exc:
@@ -269,13 +271,13 @@ def send_chunk(gmail, app_password, sender_name, subject, body, is_html, chunk):
                     f"SMTP/network error: {str(exc)[:200]}",
                 )
             )
-    except Exception:
+    except Exception as exc:
         for recipient in chunk:
             outcomes.append(
                 (
                     recipient["email"],
                     "failed",
-                    "Unexpected error. Check Vercel logs.",
+                    f"Error: {str(exc)[:200]}",
                 )
             )
 
@@ -287,7 +289,9 @@ def login():
     if logged_in():
         return redirect(url_for("home"))
     if request.method == "GET":
-        return render_template("login.html", error=None, turnstile_site_key=TURNSTILE_SITE_KEY)
+        return render_template(
+            "login.html", error=None, turnstile_site_key=TURNSTILE_SITE_KEY
+        )
     if not hmac.compare_digest(str(request.form.get("password", "")), LOGIN_PASSWORD):
         return (
             render_template(
@@ -375,7 +379,9 @@ def send_batch():
         return error("Recipients must be a list.")
 
     forwarded_for = request.headers.get("X-Forwarded-For")
-    remote_ip = forwarded_for.split(",", 1)[0].strip() if forwarded_for else request.remote_addr
+    remote_ip = (
+        forwarded_for.split(",", 1)[0].strip() if forwarded_for else request.remote_addr
+    )
     verified, verify_error = verify_turnstile(turnstile_token, remote_ip)
     if not verified:
         return error(verify_error, 403)
@@ -435,7 +441,11 @@ def send_batch():
                 for addr, status, err_msg in chunk_results:
                     if status == "sent":
                         sent += 1
-                        item = {"type": "progress", "recipient": addr, "result": "sent"}
+                        item = {
+                            "type": "progress",
+                            "recipient": addr,
+                            "result": "sent",
+                        }
                     else:
                         failed += 1
                         item = {

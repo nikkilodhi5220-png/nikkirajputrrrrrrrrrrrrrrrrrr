@@ -4,6 +4,7 @@ from datetime import timedelta
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid, formatdate
 from flask import Flask, request, render_template, redirect, url_for, jsonify, session, Response
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 app = Flask(__name__, template_folder=str(BASE_DIR/"templates"),
@@ -24,7 +25,8 @@ app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True,
 
 SMTP_HOST, SMTP_PORT, SMTP_TIMEOUT = "smtp.gmail.com", 465, 20
 MAX_RECIPIENTS = 25
-SEND_DELAY_SECONDS = 2
+SEND_DELAY_SECONDS = 0  # FAST MODE - No delay
+MAX_WORKERS = 5  # 5 parallel - Gmail safe limit
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
 def clean(value, limit=250):
@@ -64,7 +66,8 @@ def personalize(value, recipient):
         result = result.replace("{{"+key+"}}", recipient.get(key, ""))
     return result
 
-def send_one(smtp, gmail, sender_name, subject, body, is_html, recipient):
+def send_one_fast(gmail, password, sender_name, subject, body, is_html, recipient):
+    # Har thread apna alag connection banayega - yahi fast + error-free ka trick hai
     msg = EmailMessage()
     msg["Subject"] = clean(personalize(subject, recipient), 250)
     msg["From"] = formataddr((clean(sender_name), gmail))
@@ -80,9 +83,13 @@ def send_one(smtp, gmail, sender_name, subject, body, is_html, recipient):
         msg.add_alternative(content, subtype="html")
     else:
         msg.set_content(content)
-    refused = smtp.send_message(msg, from_addr=gmail, to_addrs=[recipient["email"]])
-    if refused:
-        raise smtplib.SMTPRecipientsRefused(refused)
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context(), timeout=SMTP_TIMEOUT) as smtp:
+        smtp.ehlo()
+        smtp.login(gmail, re.sub(r"\s+", "", password))
+        refused = smtp.send_message(msg, from_addr=gmail, to_addrs=[recipient["email"]])
+        if refused:
+            raise smtplib.SMTPRecipientsRefused(refused)
+    return True
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -111,7 +118,7 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "smtp": "Gmail SMTP", "max_recipients": MAX_RECIPIENTS,
-                    "send_delay_seconds": SEND_DELAY_SECONDS})
+                    "send_delay_seconds": SEND_DELAY_SECONDS, "workers": MAX_WORKERS})
 
 @app.route("/favicon.ico")
 def favicon():
@@ -161,38 +168,25 @@ def send_batch():
     def generate():
         total, sent, failed = len(recipients), 0, 0
         yield event_line({"type":"start","total":total,"sent":0,"failed":0,"remaining":total,"invalid_skipped":invalid})
-        try:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context(), timeout=SMTP_TIMEOUT) as smtp:
-                smtp.ehlo()
-                smtp.login(gmail, re.sub(r"\s+", "", password))
-                for r in recipients:
-                    try:
-                        send_one(smtp, gmail, sender_name, subject, body, is_html, r)
-                        sent += 1
-                        item = {"type":"progress","recipient":r["email"],"result":"sent"}
-                    except smtplib.SMTPAuthenticationError:
-                        failed += 1
-                        item = {"type":"progress","recipient":r["email"],"result":"failed","error":"Gmail authentication failed. Check address and App Password."}
-                    except smtplib.SMTPRecipientsRefused:
-                        failed += 1
-                        item = {"type":"progress","recipient":r["email"],"result":"failed","error":"Gmail refused this recipient."}
-                    except smtplib.SMTPResponseException as exc:
-                        failed += 1
-                        item = {"type":"progress","recipient":r["email"],"result":"failed","error":f"SMTP error {exc.smtp_code}: {str(exc.smtp_error)[:200]}"}
-                    except (smtplib.SMTPException, TimeoutError, OSError) as exc:
-                        failed += 1
-                        item = {"type":"progress","recipient":r["email"],"result":"failed","error":f"SMTP/network error: {str(exc)[:200]}"}
-                    except Exception:
-                        failed += 1
-                        item = {"type":"progress","recipient":r["email"],"result":"failed","error":"Unexpected error. Check Vercel logs."}
-                    item.update({"total":total,"sent":sent,"failed":failed,"remaining":total-sent-failed})
-                    yield event_line(item)
-                    if SEND_DELAY_SECONDS:
-                        time.sleep(SEND_DELAY_SECONDS)
-        except smtplib.SMTPAuthenticationError:
-            yield event_line({"type":"progress","recipient":"all","result":"failed","error":"Gmail authentication failed. Check address and App Password."})
-        except Exception as exc:
-            yield event_line({"type":"progress","recipient":"all","result":"failed","error":f"Connection failed: {str(exc)[:200]}"})
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, total)) as pool:
+            jobs = {pool.submit(send_one_fast, gmail, password, sender_name, subject, body, is_html, r): r for r in recipients}
+            for future in as_completed(jobs):
+                recipient = jobs[future]
+                try:
+                    future.result(); sent += 1
+                    item = {"type":"progress","recipient":recipient["email"],"result":"sent"}
+                except smtplib.SMTPAuthenticationError:
+                    failed += 1; item = {"type":"progress","recipient":recipient["email"],"result":"failed","error":"Gmail authentication failed. Check address and App Password."}
+                except smtplib.SMTPRecipientsRefused:
+                    failed += 1; item = {"type":"progress","recipient":recipient["email"],"result":"failed","error":"Gmail refused this recipient."}
+                except smtplib.SMTPResponseException as exc:
+                    failed += 1; item = {"type":"progress","recipient":recipient["email"],"result":"failed","error":f"SMTP error {exc.smtp_code}: {str(exc.smtp_error)[:200]}"}
+                except (smtplib.SMTPException, TimeoutError, OSError) as exc:
+                    failed += 1; item = {"type":"progress","recipient":recipient["email"],"result":"failed","error":f"SMTP/network error: {str(exc)[:200]}"}
+                except Exception:
+                    failed += 1; item = {"type":"progress","recipient":recipient["email"],"result":"failed","error":"Unexpected error. Check Vercel logs."}
+                item.update({"total":total,"sent":sent,"failed":failed,"remaining":total-sent-failed})
+                yield event_line(item)
         yield event_line({"type":"complete","success":failed==0,"message":"Sending attempt finished. SMTP acceptance does not prove Inbox delivery.","total":total,"sent":sent,"failed":failed,"remaining":0})
 
     response = Response(generate(), content_type="application/x-ndjson; charset=utf-8")

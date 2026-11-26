@@ -16,12 +16,19 @@ from email.utils import formataddr, make_msgid, formatdate
 from flask import Flask, request, render_template, redirect, url_for, jsonify, session, Response
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- Vercel ke liye sahi path ---
 BASE_DIR = Path(__file__).resolve().parent.parent
-app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"), static_url_path="/static")
+app = Flask(
+    __name__,
+    template_folder=str(BASE_DIR / "templates"),
+    static_folder=str(BASE_DIR / "static"),
+    static_url_path="/static"
+)
+
+# Vercel ko yahi chahiye
 handler = app
 application = app
 
-# SAFE DEFAULTS - koi bhi env missing hoga to bhi app band nahi hogi
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip() or "change-this-to-any-long-random-secret-1234567890"
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip() or "1234"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
@@ -33,10 +40,12 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
-    MAX_CONTENT_LENGTH=1_000_000,
+    MAX_CONTENT_LENGTH=1000000,
 )
 
-SMTP_HOST, SMTP_PORT, SMTP_TIMEOUT = "smtp.gmail.com", 465, 30
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
+SMTP_TIMEOUT = 30
 MAX_RECIPIENTS = 25
 MAX_WORKERS = 3
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
@@ -73,7 +82,6 @@ def normalize_recipient(item):
     out = {"email": addr}
     for k in ("name", "hi", "hello", "thanks", "ref_code"):
         out[k] = clean(item.get(k, ""), 150)
-    # default values taaki {{name}} khali na rahe
     if not out["name"]:
         out["name"] = addr.split("@")[0]
     if not out["hi"]:
@@ -145,7 +153,6 @@ def not_found(e):
 
 @app.errorhandler(500)
 def server_error(e):
-    # Vercel pe 500 aane par bhi JSON do, taaki frontend crash na ho
     if request.path.startswith("/send-batch") or request.path.startswith("/health"):
         return jsonify({"success": False, "message": "Server error, please try again."}), 500
     return render_template("login.html", error="Something went wrong. Please login again."), 500
@@ -207,7 +214,7 @@ def send_batch():
         return error("Sender name, subject and body are required.")
     if not use_resend and (not valid_email(gmail) or not gmail.endswith("@gmail.com") or not password):
         return error("Enter valid @gmail.com and App Password, or setup Resend in Vercel.")
-    if len(body) > 100_000:
+    if len(body) > 100000:
         return error("Email body is too large.")
     if not isinstance(incoming, list):
         return error("Recipients must be a list.")
